@@ -38,7 +38,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                  initial_rpys=None,
                  physics: Physics=Physics.PYB,
                  pyb_freq: int=240,
-                 ctrl_freq: int=60, # Lets raise it to 90 from 30 for better control
+                 ctrl_freq: int=60, # Lets raise it to 60 from 30 for better control ( it needs to be * of 60)
                  gui=False,
                  record=False,
                  obs: ObservationType=ObservationType.KIN,
@@ -47,13 +47,14 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                  verbose: bool=False,
                  waypoint_radius: float=0.5,
                  waypoint_hold_steps: int=5,
-                 priority_mode: str="sequential",  # "sequential", "distance", or "random"
-                 reuse_completed_waypoints: bool=True,  # Whether completed waypoints become available again
+                 priority_mode: str="distance",  # "sequential", "distance", or "random"
                  min_waypoint_separation: float=2.0,  # Minimum distance between waypoints
                  workspace_bounds: tuple=None,  # ((xmin,ymin,zmin), (xmax,ymax,zmax))
                  visualize_waypoints: bool=None,
                  waypoint_marker_radius: float=0.1,
-                 comm_range: float=5.0):
+                 # Early termination controls
+                 terminate_when_pool_exhausted: bool=True,
+                 early_termination_grace_steps: int=1):
         """Initialize environment with dynamic waypoint allocation."""
         
         # Core config
@@ -64,10 +65,15 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self.waypoint_radius = waypoint_radius
         self.waypoint_hold_steps = waypoint_hold_steps
         self.priority_mode = priority_mode
-        self.reuse_completed_waypoints = reuse_completed_waypoints
         self.min_waypoint_separation = min_waypoint_separation
-        self.comm_range = comm_range
         self.ctrl_freq = ctrl_freq
+        
+        # Early termination
+        self.terminate_when_pool_exhausted = bool(terminate_when_pool_exhausted)
+        self._early_term_reason = None
+        # Grace period (in env steps) after the last completion before terminating
+        self.early_termination_grace_steps = max(0, int(early_termination_grace_steps))
+        self._exhaustion_hold_count = 0
         
         # Workspace bounds for waypoint generation
         if workspace_bounds is None:
@@ -84,7 +90,6 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Visualization
         self.visualize_waypoints = bool(gui) if visualize_waypoints is None else bool(visualize_waypoints)
         self.waypoint_marker_radius = float(waypoint_marker_radius)
-        self._waypoint_visual_ids = []
         
         # Generate shared waypoint pool
         self._generateWaypointPool()
@@ -94,11 +99,13 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self.waypoint_owner = np.full(self.num_waypoints, -1, dtype=np.int32)  # -1 means no owner
         self.agent_target_waypoint = np.full(self.num_drones, -1, dtype=np.int32)  # -1 means no target
         self.agent_waypoints_completed = {f"agent_{i}": 0 for i in range(num_drones)}
+       
         # Additional per-episode metrics
         self.agent_waypoints_assigned = {f"agent_{i}": 0 for i in range(num_drones)}
         self.agent_waypoints_failed = {f"agent_{i}": 0 for i in range(num_drones)}
         self.agent_hold_counter = np.zeros(self.num_drones, dtype=np.int32)
-        self.agent_last_action = {f"agent_{i}": np.zeros(3, dtype=np.float32) for i in range(num_drones)}
+        # Last raw action (removed; can be reintroduced for debugging if needed)
+        
         # Track last distance-to-target per agent (for progress shaping)
         self._prev_dist = np.full(self.num_drones, np.inf, dtype=np.float32)
 
@@ -106,9 +113,10 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self._wp_assigned_counts = np.zeros(self.num_waypoints, dtype=np.int32)
         self._wp_completed_counts = np.zeros(self.num_waypoints, dtype=np.int32)
         self._wp_failed_counts = np.zeros(self.num_waypoints, dtype=np.int32)
+        # Robust total-completed counter (avoids relying on Enum array equality)
+        self._completed_total = 0
 
-        # Priority queue for waypoint assignment (agent indices)
-        self.priority_queue = list(range(self.num_drones))
+        # (Removed) Priority queue for assignment; no longer used
         
         # Fixing the idle movements of the drone 
         self._last_dist_to_target = np.full(self.num_drones, np.inf, dtype=np.float32)
@@ -158,6 +166,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     
     def _generateWaypointPool(self):
         """Generate a shared pool of waypoints with minimum separation."""
+        
         rng = np.random.default_rng()
         bounds_min, bounds_max = self.workspace_bounds
         
@@ -190,23 +199,35 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             self._log(f"[WAYPOINTS] Generated {len(self.waypoint_pool)} waypoints")
 
     def _globalAssign(self):
+        """Globally assign free agents to available waypoints using Hungarian.
+
+        Builds a distance cost matrix from each free agent to each available
+        waypoint and applies SciPy's linear_sum_assignment to minimize total
+        distance. If SciPy is not available, or there are no free agents or
+        waypoints, the method returns without changes.
+        """
         if not _HAS_SCIPY:
             return
+        
         free_agents = [i for i in range(self.num_drones) if self.agent_target_waypoint[i] < 0]
         avail = np.where(self.waypoint_status == WaypointStatus.AVAILABLE)[0]
+        
         if len(free_agents) == 0 or len(avail) == 0:
             return
         A = np.zeros((len(free_agents), len(avail)), dtype=np.float32)
+        
         for r, i in enumerate(free_agents):
             pos = self._getDroneStateVector(i)[0:3]
             A[r] = np.linalg.norm(self.waypoint_pool[avail] - pos, axis=1)
         rr, cc = linear_sum_assignment(A)
+        
         for r, c in zip(rr, cc):
             self._claimWaypoint(free_agents[r], int(avail[c]))
 
     
     def _assignInitialWaypoints(self):
         """Assign initial waypoints to agents based on priority mode."""
+       
         available_indices = np.where(self.waypoint_status == WaypointStatus.AVAILABLE)[0]
 
         if len(available_indices) == 0:
@@ -225,6 +246,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     
     def _selectWaypointForAgent(self, agent_id: int) -> int:
         """Select best available waypoint for an agent based on priority mode."""
+        
         available_indices = np.where(self.waypoint_status == WaypointStatus.AVAILABLE)[0]
         
         if len(available_indices) == 0:
@@ -248,10 +270,12 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     
     def _claimWaypoint(self, agent_id: int, waypoint_idx: int):
         """Agent claims a waypoint."""
+        
         if self.waypoint_status[waypoint_idx] == WaypointStatus.AVAILABLE:
             self.waypoint_status[waypoint_idx] = WaypointStatus.CLAIMED
             self.waypoint_owner[waypoint_idx] = agent_id
             self.agent_target_waypoint[agent_id] = waypoint_idx
+            
             # Track assignment attempt
             self.agent_waypoints_assigned[f"agent_{agent_id}"] += 1
             self._wp_assigned_counts[waypoint_idx] += 1
@@ -259,21 +283,28 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             if self.verbose:
                 self._log(f"[AGENT {agent_id}] Claimed waypoint {waypoint_idx}")
     
-    def _releaseWaypoint(self, waypoint_idx: int):
-        """Release a waypoint (mark as completed or available)."""
+    def _releaseWaypoint(self, waypoint_idx: int, to_available: bool=False):
+        """Release a waypoint.
+
+        - If to_available=False: mark as COMPLETED (successful completion)
+        - If to_available=True: mark as AVAILABLE (failed attempt)
+        """
         if waypoint_idx < 0 or waypoint_idx >= self.num_waypoints:
             return
         
         owner = self.waypoint_owner[waypoint_idx]
-        
-        if self.reuse_completed_waypoints:
+
+        if to_available:
             self.waypoint_status[waypoint_idx] = WaypointStatus.AVAILABLE
             if self.verbose and owner >= 0:
-                self._log(f"[WAYPOINT {waypoint_idx}] Released (available for reuse)")
+                self._log(f"[WAYPOINT {waypoint_idx}] Released to AVAILABLE (retry)")
         else:
+            # Increment total completed once per waypoint
+            if self.waypoint_status[waypoint_idx] != WaypointStatus.COMPLETED:
+                self._completed_total += 1
             self.waypoint_status[waypoint_idx] = WaypointStatus.COMPLETED
             if self.verbose and owner >= 0:
-                self._log(f"[WAYPOINT {waypoint_idx}] Completed (permanently)")
+                self._log(f"[WAYPOINT {waypoint_idx}] Marked COMPLETED")
         
         self.waypoint_owner[waypoint_idx] = -1
         
@@ -303,25 +334,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         
         return False
     
-    def _updatePriorityQueue(self):
-        """Update priority queue based on current mode."""
-        if self.priority_mode == "sequential":
-            # Rotate queue
-            if len(self.priority_queue) > 0:
-                self.priority_queue.append(self.priority_queue.pop(0))
-        
-        elif self.priority_mode == "distance":
-            # Sort by distance to nearest available waypoint
-            available_indices = np.where(self.waypoint_status == WaypointStatus.AVAILABLE)[0]
-            if len(available_indices) > 0:
-                distances = []
-                for agent_id in range(self.num_drones):
-                    agent_pos = self._getDroneStateVector(agent_id)[0:3]
-                    min_dist = np.min(np.linalg.norm(self.waypoint_pool[available_indices] - agent_pos, axis=1))
-                    distances.append(min_dist)
-                self.priority_queue = sorted(range(self.num_drones), key=lambda i: distances[i])
-        
-        # Random mode doesn't need queue updates
+    # (Removed) _updatePriorityQueue: priority queue logic is unused
     
     def _setupMultiAgentSpaces(self):
         """Define observation and action spaces for multi-agent setup."""
@@ -435,20 +448,25 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         Here we blend the learned directional action with the waypoint direction
         to form a next target position for each agent, then pass that to `super().step()`.
         """
+        
         full_action = np.zeros((self.num_drones, 3), dtype=np.float32)
+        
         for i in range(self.num_drones):
             agent_key = f"agent_{i}"
             raw = np.array(action_dict.get(agent_key, np.zeros(3)), dtype=np.float32)
             raw = np.clip(raw, -1.0, 1.0)
             full_action[i] = self._computeBlendedTarget(i, raw)
-            self.agent_last_action[agent_key] = raw
+            # raw action available here if needed for debugging
         
         # Step physics
         obs_array, reward_float, terminated_bool, truncated_bool, info = super().step(full_action)
+        
         for i in range(self.num_drones):
             target_i = self.agent_target_waypoint[i]
+            
             if 0 <= target_i < self.num_waypoints:
                 d = np.linalg.norm(self._getDroneStateVector(i)[0:3] - self.waypoint_pool[target_i])
+            
                 if d > self._last_dist_to_target[i] - 1e-3:
                     self._stagnant_steps[i] += 1
                 else:
@@ -460,42 +478,41 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                     self.agent_waypoints_failed[f"agent_{i}"] += 1
                     if 0 <= target_i < self.num_waypoints:
                         self._wp_failed_counts[target_i] += 1
-                    self._releaseWaypoint(target_i)
+                    self._releaseWaypoint(target_i, to_available=True)
                     self._globalAssign()
                     self._stagnant_steps[i] = 0
 
 
             # Check waypoint reached for each agent and reassign if needed
-            # Check waypoint reached for each agent and reassign if needed
-        for ag in range(self.num_drones):
-            if self._checkWaypointReached(ag):
-                old_target = self.agent_target_waypoint[ag]
+        for agent in range(self.num_drones):
+            
+            if self._checkWaypointReached(agent):
+                old_target = self.agent_target_waypoint[agent]
 
                 # Update completion count
-                agent_key = f"agent_{ag}"
+                agent_key = f"agent_{agent}"
                 self.agent_waypoints_completed[agent_key] += 1
 
-                # Release current waypoint and optionally reassign globally
-                self._releaseWaypoint(old_target)
+                # Mark current waypoint as COMPLETED and optionally reassign globally
+                self._releaseWaypoint(old_target, to_available=False)
                 if 0 <= old_target < self.num_waypoints:
                     self._wp_completed_counts[old_target] += 1
                 self._globalAssign()
 
                 # Reset hold counter
-                self.agent_hold_counter[ag] = 0
+                self.agent_hold_counter[agent] = 0
 
                 # Select and claim new waypoint if still none
-                if self.agent_target_waypoint[ag] < 0:
-                    new_wp = self._selectWaypointForAgent(ag)
+                if self.agent_target_waypoint[agent] < 0:
+                    new_wp = self._selectWaypointForAgent(agent)
                     if new_wp is not None:
-                        self._claimWaypoint(ag, new_wp)
+                        self._claimWaypoint(agent, new_wp)
 
                 if self.verbose:
-                    self._log(f"[AGENT {ag}] Completed waypoint {old_target}, "
+                    self._log(f"[AGENT {agent}] Completed waypoint {old_target}, "
                             f"total: {self.agent_waypoints_completed[agent_key]}")
 
-        # Update priority queue for next assignments
-        self._updatePriorityQueue()
+        # Ensure assignments are refreshed
         self._globalAssign()
 
         # Ensure any agent without a target immediately gets one if available
@@ -533,12 +550,14 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         Returns:
             Target position (x, y, z) for the drone's PID controller
         """
+        
         # Get current agent position and target waypoint
         agent_pos = self._getDroneStateVector(agent_id)[0:3]
         target_idx = self.agent_target_waypoint[agent_id]
-        a = np.clip(action, -1.0, 1.0)  # Ensure action is within valid range
+        action = np.clip(action, -1.0, 1.0)  # Ensure action is within valid range
 
         if 0 <= target_idx < self.num_waypoints:
+            
             # Agent has an assigned waypoint - blend waypoint following with RL action
             wp = self.waypoint_pool[target_idx]
             to_target = wp - agent_pos  # Vector from agent to waypoint
@@ -561,7 +580,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                 # Scale RL influence based on distance - more control when far from waypoint
                 # This gives RL more freedom for exploration when not close to target
                 agent_scale = 0.15 if dist < 2.0 else 0.25  # Smaller scale when close
-                agent_component = a * agent_scale  # RL action contribution
+                agent_component = action * agent_scale  # RL action contribution
 
                 # 3. FINAL TARGET: Current position + waypoint movement + RL movement
                 blended = agent_pos + waypoint_component + agent_component
@@ -573,7 +592,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         else:
             # No assigned waypoint: Allow free movement with some damping
             # RL has full control but movement is scaled down for safety
-            blended = agent_pos + a * 0.3
+            blended = agent_pos + action * 0.3
 
         # Ensure the target position stays within workspace bounds
         # This prevents drones from trying to fly outside the designated area
@@ -592,94 +611,9 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     
     def _computeAgentReward(self, agent_id: int):
         """Compute reward for a single agent."""
-        
 
         reward = 0.0
-
-        agent_state = self._getDroneStateVector(agent_id)
-        agent_pos = agent_state[0:3]
-        agent_vel = agent_state[10:13]
-
-        target_idx = self.agent_target_waypoint[agent_id]
-
-        # Reward for having a target (increased)
-        if target_idx >= 0:
-            reward += 0.5  # Increased from 0.1
-
-            # Distance reward
-            target_pos = self.waypoint_pool[target_idx]
-            distance = np.linalg.norm(agent_pos - target_pos)
-            max_distance = 10.0
-            distance_reward = max(0.0, 1.0 - distance / max_distance)
-            reward += distance_reward * 1.0  # Increased from 0.5
-
-            # Progress shaping: reward positive reduction in distance step-to-step
-            prev = self._prev_dist[agent_id]
-            if not np.isfinite(prev):
-                # First use this episode: initialize without giving extra reward
-                self._prev_dist[agent_id] = distance
-            else:
-                progress = prev - distance  # >0 means getting closer
-                reward += 0.5 * np.clip(progress, -0.5, 0.5)  # Increased from 0.3
-                self._prev_dist[agent_id] = distance
-
-            # Velocity toward target
-            if distance > 0.1:
-                direction = (target_pos - agent_pos) / distance
-                vel_toward = np.dot(agent_vel, direction)
-                reward += vel_toward * 0.2  # Increased from 0.1
-
-            # Waypoint reached bonus (per step while in radius)
-            if distance < self.waypoint_radius:
-                reward += 2.0  # Increased from 1.0
-
-        else:
-            # Reduced penalty for not having a target
-            reward -= 0.1  # Reduced from -0.5
-
-        # Reduced stability penalties
-        roll, pitch = agent_state[7:9]
-        if abs(roll) > np.pi/4 or abs(pitch) > np.pi/4:  # Relaxed threshold
-            reward -= 0.1  # Reduced from -0.2
-
-        # Reduced altitude penalties
-        if agent_pos[2] < 0.5:  # Relaxed threshold
-            reward -= 0.5  # Reduced from -1.0
-        elif agent_pos[2] > 2.5:  # Relaxed threshold
-            reward -= 0.1  # Reduced from -0.3
-
-        # Collision avoidance - reduced penalty
-        for j in range(self.num_drones):
-            if j != agent_id:
-                other_pos = self._getDroneStateVector(j)[0:3]
-                dist = np.linalg.norm(agent_pos - other_pos)
-                if dist < 1.0:  # Increased safe distance
-                    reward -= 1.0 * max(0, 1.0 - dist)  # Reduced penalty
-
-        # Completion bonus (sparse reward) - kept high but add diminishing returns
-        if not hasattr(self, '_last_completed_count'):
-            self._last_completed_count = {f'agent_{i}': 0 for i in range(self.num_drones)}
-
-        key = f'agent_{agent_id}'
-        if key not in self._last_completed_count:
-            self._last_completed_count[key] = 0
-
-        current_count = self.agent_waypoints_completed[key]
-        if current_count > self._last_completed_count[key]:
-            # Diminishing returns for multiple completions in one episode
-            bonus_multiplier = max(0.3, 1.0 - (current_count - 1) * 0.2)
-            reward += 10.0 * bonus_multiplier
-            self._last_completed_count[key] = current_count
-
-        if self.verbose:
-            return self._computeDetailedReward(agent_id)
-
-        return float(np.clip(reward, -2.0, 8.0))  # Tighter clipping to reduce extremes
-
-    def _computeDetailedReward(self, agent_id: int):
-        """Compute reward with detailed logging for debugging."""
-        reward = 0.0
-        components = {}
+        components = {} if self.verbose else None
 
         agent_state = self._getDroneStateVector(agent_id)
         agent_pos = agent_state[0:3]
@@ -689,56 +623,67 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
 
         # Reward for having a target
         if target_idx >= 0:
-            components['has_target'] = 0.5
             reward += 0.5
+            if components is not None:
+                components['has_target'] = 0.5
 
             # Distance reward
             target_pos = self.waypoint_pool[target_idx]
             distance = np.linalg.norm(agent_pos - target_pos)
-            max_distance = 10.0
+            max_distance = 10.0 
             distance_reward = max(0.0, 1.0 - distance / max_distance)
-            components['distance'] = distance_reward * 1.0
             reward += distance_reward * 1.0
+            if components is not None:
+                components['distance'] = distance_reward * 1.0
 
             # Progress shaping
             prev = self._prev_dist[agent_id]
-            if np.isfinite(prev):
+            if not np.isfinite(prev):
+                self._prev_dist[agent_id] = distance
+            else:
                 progress = prev - distance
                 progress_reward = 0.5 * np.clip(progress, -0.5, 0.5)
-                components['progress'] = progress_reward
                 reward += progress_reward
-            self._prev_dist[agent_id] = distance
+                if components is not None:
+                    components['progress'] = float(progress_reward)
+                self._prev_dist[agent_id] = distance
 
             # Velocity toward target
             if distance > 0.1:
                 direction = (target_pos - agent_pos) / distance
                 vel_toward = np.dot(agent_vel, direction)
                 vel_reward = vel_toward * 0.2
-                components['velocity'] = vel_reward
                 reward += vel_reward
+                if components is not None:
+                    components['velocity'] = float(vel_reward)
 
-            # Waypoint reached bonus
+            # In-radius bonus
             if distance < self.waypoint_radius:
-                components['in_radius'] = 2.0
                 reward += 2.0
+                if components is not None:
+                    components['in_radius'] = 2.0
 
         else:
-            components['no_target'] = -0.1
             reward -= 0.1
+            if components is not None:
+                components['no_target'] = -0.1
 
         # Stability penalties
         roll, pitch = agent_state[7:9]
         if abs(roll) > np.pi/4 or abs(pitch) > np.pi/4:
-            components['stability'] = -0.1
             reward -= 0.1
+            if components is not None:
+                components['stability'] = -0.1
 
         # Altitude penalties
         if agent_pos[2] < 0.5:
-            components['altitude_low'] = -0.5
             reward -= 0.5
+            if components is not None:
+                components['altitude_low'] = -0.5
         elif agent_pos[2] > 2.5:
-            components['altitude_high'] = -0.1
             reward -= 0.1
+            if components is not None:
+                components['altitude_high'] = -0.1
 
         # Collision avoidance
         for j in range(self.num_drones):
@@ -746,30 +691,35 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                 other_pos = self._getDroneStateVector(j)[0:3]
                 dist = np.linalg.norm(agent_pos - other_pos)
                 if dist < 1.0:
-                    collision_penalty = -1.0 * max(0, 1.0 - dist)
-                    components[f'collision_{j}'] = collision_penalty
-                    reward += collision_penalty
+                    penalty = -1.0 * max(0, 1.0 - dist)
+                    reward += penalty
+                    if components is not None:
+                        components[f'collision_{j}'] = float(penalty)
 
-        # Completion bonus
+        # Completion bonus with diminishing returns
+        if not hasattr(self, '_last_completed_count'):
+            self._last_completed_count = {f'agent_{i}': 0 for i in range(self.num_drones)}
         key = f'agent_{agent_id}'
+        if key not in self._last_completed_count:
+            self._last_completed_count[key] = 0
         current_count = self.agent_waypoints_completed[key]
-        if hasattr(self, '_last_completed_count') and key in self._last_completed_count:
-            if current_count > self._last_completed_count[key]:
-                components['completion'] = 10.0
-                reward += 10.0
-                self._last_completed_count[key] = current_count
-        else:
-            if not hasattr(self, '_last_completed_count'):
-                self._last_completed_count = {}
+        if current_count > self._last_completed_count[key]:
+            bonus_multiplier = max(0.3, 1.0 - (current_count - 1) * 0.2)
+            completion_bonus = 10.0 * bonus_multiplier
+            reward += completion_bonus
+            if components is not None:
+                components['completion'] = float(completion_bonus)
             self._last_completed_count[key] = current_count
 
-        if self.verbose and reward < -1.0:  # Log negative rewards
+        if self.verbose and reward < -1.0:
             self._log(f"[REWARD] Agent {agent_id}: {reward:.2f} - Components: {components}")
 
-        return float(np.clip(reward, -5.0, 15.0))
+        return float(np.clip(reward, -2.0, 8.0))
+
+    # (Removed) _computeDetailedReward: merged into _computeAgentReward when verbose
     
     def _computeTerminatedDict(self):
-        """Check termination conditions for all agents."""
+        """Check termination conditions for all agents, including early termination."""
         terminated = {}
         
         for i in range(self.num_drones):
@@ -788,7 +738,23 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                 terminated[agent_key] = True
             else:
                 terminated[agent_key] = False
-        
+
+        # Early termination: pool exhausted and no active targets
+        if self._early_term_reason is None and self.terminate_when_pool_exhausted:
+            
+            # Robust: use completed counter instead of Enum array compare
+            all_completed = (self._completed_total >= self.num_waypoints)
+            no_targets = np.all(self.agent_target_waypoint < 0)
+            if all_completed and no_targets:
+                self._exhaustion_hold_count += 1
+                if self._exhaustion_hold_count >= self.early_termination_grace_steps:
+                    for i in range(self.num_drones):
+                        terminated[f"agent_{i}"] = True
+                    self._early_term_reason = "waypoint_pool_exhausted"
+            else:
+                # Reset hold counter if condition no longer holds
+                self._exhaustion_hold_count = 0
+
         return terminated
     
     def _computeTruncatedDict(self):
@@ -797,7 +763,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         return {f"agent_{i}": time_limit_reached for i in range(self.num_drones)}
     
     def _computeInfoDict(self):
-        """Compute info dictionary for all agents."""
+        """Compute info dictionary for all agents, with episode-level diagnostics."""
         info = {}
         
         for i in range(self.num_drones):
@@ -819,6 +785,13 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             "completed": self._wp_completed_counts.copy(),
             "failed": self._wp_failed_counts.copy()
         }
+
+        # Add early termination reason if any
+        if self._early_term_reason is not None:
+            info["early_termination"] = True
+            info["early_termination_reason"] = self._early_term_reason
+        else:
+            info["early_termination"] = False
         
         return info
     
@@ -835,6 +808,9 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self._wp_assigned_counts[:] = 0
         self._wp_completed_counts[:] = 0
         self._wp_failed_counts[:] = 0
+        self._early_term_reason = None
+        self._exhaustion_hold_count = 0
+        self._completed_total = 0
         
         # Reset progress tracker
         self._prev_dist[:] = np.inf
@@ -844,10 +820,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         if options and options.get('regenerate_waypoints', False):
             self._generateWaypointPool()
         
-        # Reset priority queue
-        self.priority_queue = list(range(self.num_drones))
-        if self.priority_mode == "random":
-            np.random.shuffle(self.priority_queue)
+        # No priority queue state to reset
         
         # Parent reset
         obs, info = super().reset(seed=seed, options=options)
@@ -866,14 +839,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         super()._addObstacles()
         
         if self.GUI and self.visualize_waypoints:
-            # Clean up old visuals
-            for vid in self._waypoint_visual_ids:
-                try:
-                    p.removeBody(vid, physicsClientId=self.CLIENT)
-                except:
-                    pass
-            self._waypoint_visual_ids = []
-            
+            # Clean up old visuals is unnecessary after reset (bodies are cleared)
             # Create waypoint markers
             for i, waypoint in enumerate(self.waypoint_pool):
                 # Color
@@ -893,8 +859,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                     basePosition=waypoint.tolist(),
                     physicsClientId=self.CLIENT
                 )
-                
-                self._waypoint_visual_ids.append(body_id)
+                # No need to store visual body IDs by default
     
     def _computeReward(self):
         """Required by BaseAviary - returns sum of agent rewards."""

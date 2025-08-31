@@ -12,7 +12,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Dict, Optional
+from typing import Dict
 import matplotlib.pyplot as plt
 import numpy as np
 import gymnasium as gym
@@ -153,8 +153,8 @@ class DroneVisualizer:
                 waypoint_radius=self.args.waypoint_radius,
                 waypoint_hold_steps=self.args.waypoint_hold_steps,
                 priority_mode=self.args.priority_mode,
-                reuse_completed_waypoints=self.args.reuse_completed_waypoints,
                 min_waypoint_separation=self.args.min_waypoint_separation,
+                terminate_when_pool_exhausted=(not self.args.no_pool_exhaustion_termination),
                 gui=True,  # GUI ON
                 record=self.args.record,
                 verbose= True, #self.args.verbose,
@@ -195,17 +195,14 @@ class DroneVisualizer:
         self.policy = PPO.load(self.args.model, device=self.args.device)
         print(f"[VIS] Loaded model from {self.args.model}")
 
-        # ---- Sanity check: env obs dim vs model expected dim ----
+        # ---- Sanity check: env obs dim vs model expected dim (no reset) ----
         try:
-            obs = self.vec.reset()
-            curr_dim = int(obs.shape[1])  # (n_env=1, dim)
+            curr_dim = int(np.prod(self.vec.observation_space.shape))
         except Exception:
-            # Some wrappers return tuple (obs, info)
-            obs, _info = self.vec.reset(), None
-            curr_dim = int(obs.shape[1])
-        expected_dim = int(self.policy.observation_space.shape[0])
+            curr_dim = None
+        expected_dim = int(np.prod(self.policy.observation_space.shape))
 
-        if curr_dim != expected_dim:
+        if curr_dim is not None and curr_dim != expected_dim:
             # Try to print the env module file path to diagnose mismatched env copy
             env_mod_name = MultiAgentReinforcementLearning.__module__
             env_file = None
@@ -253,7 +250,12 @@ class DroneVisualizer:
         last_failed = {}
 
         if self.using_model:
-            obs = self.vec.reset()
+            # Reset with waypoint regeneration to ensure fresh pool each episode
+            try:
+                obs = self.vec.reset(options={"regenerate_waypoints": True})
+            except TypeError:
+                # Older VecEnv signature without options support
+                obs = self.vec.reset()
             done = False
             while not done:
                 action, _ = self.policy.predict(obs, deterministic=True)
@@ -286,10 +288,12 @@ class DroneVisualizer:
         per_agent = [last_completions.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
         per_agent_assigned = [last_assigned.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
         per_agent_failed = [last_failed.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
+        
         success_rates = [ (c/a) if a > 0 else 0.0 for c, a in zip(per_agent, per_agent_assigned) ]
         mean_success = float(np.mean(success_rates)) if success_rates else 0.0
         duration_sec = step / float(self.args.ctrl_freq) if self.args.ctrl_freq > 0 else 0.0
         completions_per_min = (total_completions / duration_sec * 60.0) if duration_sec > 0 else 0.0
+        
         stats = {
             "episode": episode_idx,
             "reward": ep_reward,
@@ -355,7 +359,7 @@ class DroneVisualizer:
     def run(self):
         print(f"\nStarting visualization for {self.args.episodes} episode(s)")
         print(f"  Drones: {self.args.num_drones} | Waypoints: {self.args.num_waypoints} | "
-              f"Priority: {self.args.priority_mode} | Reuse: {self.args.reuse_completed_waypoints}")
+              f"Priority: {self.args.priority_mode}")
         try:
             for ep in range(self.args.episodes):
                 st = self.run_episode(ep)
@@ -438,6 +442,32 @@ class DroneVisualizer:
                          success_rate_mean=np.array(suc, dtype=np.float32),
                          completions_per_min=np.array(cpm, dtype=np.float32))
                 print(f"[VIS][SAVE] Saved raw metrics to {out_npz}")
+            else:
+                # Still produce placeholder graphs if requested to always create graphs
+                out_dir = getattr(self.args, 'out_dir', CURRENT_DIR)
+                os.makedirs(out_dir, exist_ok=True)
+
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.text(0.5, 0.5, 'No episodes run', ha='center', va='center', transform=plt.gca().transAxes)
+                plt.title('Return per Episode (empty)')
+                plt.subplot(1, 2, 2)
+                plt.text(0.5, 0.5, 'No episodes run', ha='center', va='center', transform=plt.gca().transAxes)
+                plt.title('Completions per Episode (empty)')
+                out_path = os.path.join(out_dir, 'vis_episode_metrics.png')
+                plt.tight_layout(); plt.savefig(out_path, dpi=150, bbox_inches='tight'); plt.close()
+                print(f"[VIS][PLOT] Saved {out_path}")
+
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.text(0.5, 0.5, 'No episodes run', ha='center', va='center', transform=plt.gca().transAxes)
+                plt.title('Success Rate per Episode (empty)')
+                plt.subplot(1, 2, 2)
+                plt.text(0.5, 0.5, 'No episodes run', ha='center', va='center', transform=plt.gca().transAxes)
+                plt.title('Completions per Minute (empty)')
+                out_path2 = os.path.join(out_dir, 'vis_waypoint_metrics.png')
+                plt.tight_layout(); plt.savefig(out_path2, dpi=150, bbox_inches='tight'); plt.close()
+                print(f"[VIS][PLOT] Saved {out_path2}")
 
 
 # -----------------------------------------------------------------------------
@@ -455,15 +485,17 @@ def parse_args():
     # Env params (must match training for best results)
     p.add_argument("--num-drones", type=int, default=4)
     p.add_argument("--num-waypoints", type=int, default=20)
-    p.add_argument("--episode-len", type=int, default=60)
+    p.add_argument("--episode-len", type=int, default=120)
     p.add_argument("--waypoint-radius", type=float, default=0.5)
     p.add_argument("--waypoint-hold-steps", type=int, default=5)
     p.add_argument("--priority-mode", type=str, default="distance",
                    choices=["sequential", "distance", "random"])
-    p.add_argument("--reuse-completed-waypoints", action="store_true")
     p.add_argument("--min-waypoint-separation", type=float, default=2.0)
     p.add_argument("--pyb-freq", type=int, default=240)
     p.add_argument("--ctrl-freq", type=int, default=60)
+    # Early termination controls (match training if used)
+    p.add_argument("--no-pool-exhaustion-termination", action="store_true",
+                   help="Disable early termination when the waypoint pool is exhausted")
 
     # Visualization
     p.add_argument("--episodes", type=int, default=3)

@@ -7,10 +7,10 @@ Training script for dynamic waypoint multi-agent environment (centralized PPO).
 
 Usage (typical):
   python Marl_dyn_train.py.py --timesteps 500000 --num-drones 4 --num-waypoints 20 \
-    --waypoint-radius 0.5 --waypoint-hold-steps 5 --ctrl-freq 60 --reuse-completed-waypoints
+    --waypoint-radius 0.5 --waypoint-hold-steps 5 --ctrl-freq 60
 
 Quick test:
-  python Marl_dyn_train.py.py --quick --reuse-completed-waypoints
+  python Marl_dyn_train.py.py --quick
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium import spaces
-
+import torch.nn as nn
 # --------------------------
 # Robust import of the env
 # --------------------------
@@ -269,10 +269,14 @@ def plot_rewards(rewards, timesteps, save_path, title="Training Rewards"):
 
     # Plot rewards
     plt.subplot(1, 2, 1)
-    plt.plot(timesteps, rewards, 'b-', alpha=0.7, linewidth=1)
+    if len(rewards) > 0:
+        plt.plot(timesteps, rewards, 'b-', alpha=0.7, linewidth=1)
+        plt.title(f'{title} - Rewards')
+    else:
+        plt.text(0.5, 0.5, 'No episode rewards recorded', ha='center', va='center', transform=plt.gca().transAxes)
+        plt.title(f'{title} - Rewards (empty)')
     plt.xlabel('Timesteps')
     plt.ylabel('Episode Reward')
-    plt.title(f'{title} - Rewards')
     plt.grid(True, alpha=0.3)
 
     # Plot moving average
@@ -285,7 +289,10 @@ def plot_rewards(rewards, timesteps, save_path, title="Training Rewards"):
 
     # Plot reward distribution
     plt.subplot(1, 2, 2)
-    plt.hist(rewards, bins=30, alpha=0.7, color='blue', edgecolor='black')
+    if len(rewards) > 0:
+        plt.hist(rewards, bins=30, alpha=0.7, color='blue', edgecolor='black')
+    else:
+        plt.text(0.5, 0.5, 'No data', ha='center', va='center', transform=plt.gca().transAxes)
     plt.xlabel('Episode Reward')
     plt.ylabel('Frequency')
     plt.title(f'{title} - Reward Distribution')
@@ -303,7 +310,7 @@ def plot_reward_stats(rewards, timesteps, save_path):
     # Rolling statistics
     plt.subplot(2, 2, 1)
     window = min(100, len(rewards) // 5)
-    if len(rewards) > window:
+    if len(rewards) > window and window > 0:
         rolling_mean = np.convolve(rewards, np.ones(window)/window, mode='valid')
         rolling_std = [np.std(rewards[i:i+window]) for i in range(len(rewards)-window+1)]
         rolling_timesteps = timesteps[window-1:]
@@ -321,7 +328,7 @@ def plot_reward_stats(rewards, timesteps, save_path):
 
     # Cumulative best reward
     plt.subplot(2, 2, 2)
-    if rewards:
+    if len(rewards) > 0:
         best_rewards = []
         current_best = float('-inf')
         for r in rewards:
@@ -332,6 +339,8 @@ def plot_reward_stats(rewards, timesteps, save_path):
         plt.ylabel('Best Reward So Far')
         plt.title('Cumulative Best Reward')
         plt.grid(True, alpha=0.3)
+    else:
+        plt.text(0.5, 0.5, 'No data', ha='center', va='center', transform=plt.gca().transAxes)
 
     # Reward improvement rate
     plt.subplot(2, 2, 3)
@@ -343,6 +352,8 @@ def plot_reward_stats(rewards, timesteps, save_path):
         plt.ylabel('Reward Change')
         plt.title('Episode-to-Episode Reward Changes')
         plt.grid(True, alpha=0.3)
+    else:
+        plt.text(0.5, 0.5, 'No data', ha='center', va='center', transform=plt.gca().transAxes)
 
     # Learning curves comparison
     plt.subplot(2, 2, 4)
@@ -358,6 +369,8 @@ def plot_reward_stats(rewards, timesteps, save_path):
         plt.ylabel('Episode Reward')
         plt.title('Reward Distribution by Training Phase')
         plt.grid(True, alpha=0.3)
+    else:
+        plt.text(0.5, 0.5, 'Not enough data', ha='center', va='center', transform=plt.gca().transAxes)
 
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, 'reward_statistics.png'), dpi=150, bbox_inches='tight')
@@ -368,27 +381,31 @@ def plot_waypoint_metrics(timesteps, total_completed, per_agent_completed_series
                           total_assigned, total_failed, success_rate_mean,
                           save_path, title="Waypoint Metrics"):
     """Plot waypoint-related training metrics and save as PNG."""
-    if not timesteps:
-        return
+    # Always produce a figure (even if empty) to satisfy 'always create graphs'
 
     # Prepare x-axis
-    x = np.array(timesteps)
+    x = np.array(timesteps) if len(timesteps) > 0 else np.array([0])
 
     plt.figure(figsize=(14, 10))
 
     # (1) Total completions over time
     plt.subplot(2, 2, 1)
-    plt.plot(x, total_completed, 'g-', label='Total completions/ep')
+    if len(total_completed) > 0:
+        plt.plot(x if len(timesteps)>0 else range(len(total_completed)), total_completed, 'g-', label='Total completions/ep')
     if len(total_completed) > 10:
         w = max(5, len(total_completed)//20)
         ma = np.convolve(total_completed, np.ones(w)/w, mode='valid')
-        plt.plot(x[w-1:], ma, 'k--', alpha=0.8, label=f'MA (w={w})')
+        xx = (x if len(timesteps)>0 else np.arange(len(total_completed)))[w-1:]
+        plt.plot(xx, ma, 'k--', alpha=0.8, label=f'MA (w={w})')
     plt.xlabel('Timesteps'); plt.ylabel('Completions'); plt.title('Waypoint Completions'); plt.grid(True, alpha=0.3); plt.legend()
 
     # (2) Success rate (mean across agents)
     plt.subplot(2, 2, 2)
-    sr = np.array(success_rate_mean)
-    plt.plot(x, sr, 'b-')
+    sr = np.array(success_rate_mean) if len(success_rate_mean) > 0 else np.array([])
+    if sr.size > 0:
+        plt.plot(x if len(timesteps)>0 else range(len(sr)), sr, 'b-')
+    else:
+        plt.text(0.5, 0.5, 'No data', ha='center', va='center', transform=plt.gca().transAxes)
     plt.ylim(0.0, 1.05)
     plt.xlabel('Timesteps'); plt.ylabel('Success rate'); plt.title('Mean Success Rate'); plt.grid(True, alpha=0.3)
 
@@ -398,14 +415,16 @@ def plot_waypoint_metrics(timesteps, total_completed, per_agent_completed_series
         n_agents = len(per_agent_completed_series[0])
         for a in range(n_agents):
             series = [row[a] if a < len(row) else 0 for row in per_agent_completed_series]
-            plt.plot(x, series, label=f'agent_{a}')
+            plt.plot(x if len(timesteps)>0 else range(len(series)), series, label=f'agent_{a}')
         plt.legend(ncol=2, fontsize=8)
     plt.xlabel('Timesteps'); plt.ylabel('Completions'); plt.title('Per-Agent Completions'); plt.grid(True, alpha=0.3)
 
     # (4) Assigned vs failed per episode
     plt.subplot(2, 2, 4)
-    plt.plot(x, total_assigned, 'c-', label='Assigned/ep')
-    plt.plot(x, total_failed, 'r-', label='Failed/ep')
+    if len(total_assigned) > 0:
+        plt.plot(x if len(timesteps)>0 else range(len(total_assigned)), total_assigned, 'c-', label='Assigned/ep')
+    if len(total_failed) > 0:
+        plt.plot(x if len(timesteps)>0 else range(len(total_failed)), total_failed, 'r-', label='Failed/ep')
     plt.xlabel('Timesteps'); plt.ylabel('Count'); plt.title('Assigned vs Failed'); plt.grid(True, alpha=0.3); plt.legend()
 
     plt.tight_layout()
@@ -427,8 +446,8 @@ def make_env(args, rank: int = 0):
             waypoint_radius=args.waypoint_radius,
             waypoint_hold_steps=args.waypoint_hold_steps,
             priority_mode=args.priority_mode,
-            reuse_completed_waypoints=args.reuse_completed_waypoints,
             min_waypoint_separation=args.min_waypoint_separation,
+            terminate_when_pool_exhausted=(not args.no_pool_exhaustion_termination),
             gui=False,  # GUI off for training
             verbose=args.verbose,
             pyb_freq=args.pyb_freq,
@@ -469,15 +488,17 @@ def parse_args():
     # Env
     p.add_argument("--num-drones", type=int, default=4)
     p.add_argument("--num-waypoints", type=int, default=20)
-    p.add_argument("--episode-len", type=int, default=60)
+    p.add_argument("--episode-len", type=int, default=3000)
     p.add_argument("--waypoint-radius", type=float, default=0.5)
     p.add_argument("--waypoint-hold-steps", type=int, default=5)
     p.add_argument("--priority-mode", type=str, default="distance",
                    choices=["sequential", "distance", "random"])
-    p.add_argument("--reuse-completed-waypoints", action="store_true")
     p.add_argument("--min-waypoint-separation", type=float, default=2.0)
     p.add_argument("--pyb-freq", type=int, default=240)
     p.add_argument("--ctrl-freq", type=int, default=60)
+    # Early termination
+    p.add_argument("--no-pool-exhaustion-termination", action="store_true",
+                   help="Disable early termination when the waypoint pool is exhausted")
 
     # Output
     p.add_argument("--save-path", type=str, default="models/dynamic_waypoints_ppo")
@@ -492,8 +513,7 @@ def parse_args():
     # Quick smoke test
     p.add_argument("--quick", action="store_true", help="Reduced settings for a fast test run")
     p.add_argument("--verbose", action="store_true", help="Enable verbose logging for debugging")
-    p.add_argument("--plot-rewards", action="store_true", help="Generate reward and waypoint plots after training")
-    p.add_argument("--plot-metrics", action="store_true", help="Alias for --plot-rewards")
+    # Always plotting; legacy flags removed
 
     return p.parse_args()
 
@@ -502,10 +522,6 @@ def parse_args():
 # --------------------------
 def main():
     args = parse_args()
-    
-    # Back-compat alias
-    if args.plot_metrics:
-        args.plot_rewards = True
 
     # Quick mode
     if args.quick:
@@ -513,7 +529,7 @@ def main():
         args.n_steps = 10*512
         args.eval_freq = 5_000
         args.save_freq = 5_000
-        args.num_waypoints = 10
+        args.num_waypoints = 20
         print("[INFO] Quick mode enabled")
 
     # Seeds
@@ -536,7 +552,7 @@ def main():
 
     # ---------- Build EVAL env: Dummy -> VecMonitor -> VecNormalize (no reward norm) ----------
     print("Creating evaluation environment...")
-    eval_env: VecNormalize = DummyVecEnv([make_env(args, rank=10_000)])
+    eval_env: VecNormalize = DummyVecEnv([make_env(args, rank=1_000)])
     eval_env = VecMonitor(eval_env)
     eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False)
 
@@ -544,8 +560,20 @@ def main():
     eval_env.obs_rms = train_env.obs_rms
     eval_env.ret_rms = train_env.ret_rms
 
+    # ---------- Build EVAL env: Dummy -> VecMonitor -> VecNormalize (no reward norm) ----------
+    # Evaluation has been removed to keep training uninterrupted.
+
     # ---------- PPO model ----------
-    policy_kwargs = dict(net_arch=[512, 512, 256])
+    #policy_kwargs = dict(net_arch=[512, 512, 256])
+
+    policy_kwargs = dict(
+    activation_fn=nn.ReLU,
+    net_arch=dict(pi=[512,512,256], vf=[512,512,256]),
+    log_std_init=-0.8,
+    ortho_init=True,
+    share_features_extractor=False,
+)
+    
     print("Creating PPO model.")
     model = PPO(
         "MlpPolicy",
@@ -631,73 +659,54 @@ def main():
     print(f"\n[OK] Final model saved to {final_path}.zip")
     print(f"[OK] VecNormalize stats saved to {os.path.join(args.save_path, 'vecnormalize.pkl')}")
 
-    # ---------- Generate reward plots if requested ----------
-    if args.plot_rewards and reward_tracker.episode_rewards:
-        print("\n[PLOT] Generating reward progression plots...")
-        plot_rewards(reward_tracker.episode_rewards, reward_tracker.timesteps,
-                    args.save_path, "MARL Dynamic Waypoints PPO")
-        plot_reward_stats(reward_tracker.episode_rewards, reward_tracker.timesteps,
-                         args.save_path)
+    # ---------- Generate plots (always) ----------
+    print("\n[PLOT] Generating reward and waypoint plots...")
+    plot_rewards(reward_tracker.episode_rewards, reward_tracker.timesteps,
+                 args.save_path, "MARL Dynamic Waypoints PPO")
+    plot_reward_stats(reward_tracker.episode_rewards, reward_tracker.timesteps,
+                      args.save_path)
 
-        # Save raw reward data
-        reward_data = {
-            'timesteps': reward_tracker.timesteps,
-            'rewards': reward_tracker.episode_rewards,
-            'lengths': reward_tracker.episode_lengths
-        }
-        np.savez(os.path.join(args.save_path, 'reward_data.npz'), **reward_data)
-        print(f"[SAVE] Raw reward data saved to {os.path.join(args.save_path, 'reward_data.npz')}")
+    # Save raw reward data (possibly empty)
+    reward_data = {
+        'timesteps': np.array(reward_tracker.timesteps, dtype=np.int64),
+        'rewards': np.array(reward_tracker.episode_rewards, dtype=np.float32),
+        'lengths': np.array(reward_tracker.episode_lengths, dtype=np.int32)
+    }
+    np.savez(os.path.join(args.save_path, 'reward_data.npz'), **reward_data)
+    print(f"[SAVE] Raw reward data saved to {os.path.join(args.save_path, 'reward_data.npz')}")
 
-        # Waypoint metrics plots
-        if waypoint_cb.timesteps:
-            print("[PLOT] Generating waypoint metrics plots...")
-            plot_waypoint_metrics(
-                timesteps=waypoint_cb.timesteps,
-                total_completed=waypoint_cb.total_completed_series,
-                per_agent_completed_series=waypoint_cb.per_agent_completed_series,
-                total_assigned=waypoint_cb.total_assigned_series,
-                total_failed=waypoint_cb.total_failed_series,
-                success_rate_mean=waypoint_cb.success_rate_mean_series,
-                save_path=args.save_path,
-                title="MARL Waypoint Metrics"
-            )
+    # Waypoint metrics plots (always create a figure)
+    plot_waypoint_metrics(
+        timesteps=waypoint_cb.timesteps,
+        total_completed=waypoint_cb.total_completed_series,
+        per_agent_completed_series=waypoint_cb.per_agent_completed_series,
+        total_assigned=waypoint_cb.total_assigned_series,
+        total_failed=waypoint_cb.total_failed_series,
+        success_rate_mean=waypoint_cb.success_rate_mean_series,
+        save_path=args.save_path,
+        title="MARL Waypoint Metrics"
+    )
 
-            # Save raw waypoint metrics
-            # Convert per-agent list of lists to padded ndarray for saving
-            max_agents = max((len(row) for row in waypoint_cb.per_agent_completed_series), default=0)
-            per_agent_arr = np.zeros((len(waypoint_cb.per_agent_completed_series), max_agents), dtype=np.int32)
-            for idx, row in enumerate(waypoint_cb.per_agent_completed_series):
-                for j, val in enumerate(row):
-                    per_agent_arr[idx, j] = val
+    # Save raw waypoint metrics (possibly empty)
+    max_agents = max((len(row) for row in waypoint_cb.per_agent_completed_series), default=0)
+    per_agent_arr = np.zeros((len(waypoint_cb.per_agent_completed_series), max_agents), dtype=np.int32)
+    for idx, row in enumerate(waypoint_cb.per_agent_completed_series):
+        for j, val in enumerate(row):
+            per_agent_arr[idx, j] = val
 
-            wp_metrics = {
-                'timesteps': np.array(waypoint_cb.timesteps, dtype=np.int64),
-                'total_completed': np.array(waypoint_cb.total_completed_series, dtype=np.int32),
-                'total_assigned': np.array(waypoint_cb.total_assigned_series, dtype=np.int32),
-                'total_failed': np.array(waypoint_cb.total_failed_series, dtype=np.int32),
-                'success_rate_mean': np.array(waypoint_cb.success_rate_mean_series, dtype=np.float32),
-                'per_agent_completed': per_agent_arr
-            }
-            np.savez(os.path.join(args.save_path, 'waypoint_metrics.npz'), **wp_metrics)
-            print(f"[SAVE] Waypoint metrics saved to {os.path.join(args.save_path, 'waypoint_metrics.npz')}")
+    wp_metrics = {
+        'timesteps': np.array(waypoint_cb.timesteps, dtype=np.int64),
+        'total_completed': np.array(waypoint_cb.total_completed_series, dtype=np.int32),
+        'total_assigned': np.array(waypoint_cb.total_assigned_series, dtype=np.int32),
+        'total_failed': np.array(waypoint_cb.total_failed_series, dtype=np.int32),
+        'success_rate_mean': np.array(waypoint_cb.success_rate_mean_series, dtype=np.float32),
+        'per_agent_completed': per_agent_arr
+    }
+    np.savez(os.path.join(args.save_path, 'waypoint_metrics.npz'), **wp_metrics)
+    print(f"[SAVE] Waypoint metrics saved to {os.path.join(args.save_path, 'waypoint_metrics.npz')}")
 
-    #### Print training progression ############################
-    eval_file = os.path.join(args.save_path, 'evaluations.npz')
-    if os.path.isfile(eval_file):
-        with np.load(eval_file) as data:
-            for j in range(data['timesteps'].shape[0]):
-                print(str(data['timesteps'][j]) + "," + str(data['results'][j][0]))
-
-    ############################################################
-    ############################################################
-    ############################################################
-    ############################################################
-    ############################################################
-
-    
     # Cleanup
     train_env.close()
-    eval_env.close()
 
 if __name__ == "__main__":
     main()
