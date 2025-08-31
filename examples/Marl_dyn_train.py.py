@@ -144,39 +144,94 @@ class RolloutPrinter(BaseCallback):
             self.logger.record("train/ep_len_mean_recent", mean_l)
 
 class WaypointTrainingCallback(BaseCallback):
-    """Log custom MARL metrics (per-episode waypoint completions) when episodes end."""
+    """Collect and log per-episode waypoint metrics when episodes end."""
     def __init__(self, verbose: int = 1, log_freq: int = 100):
         super().__init__(verbose)
         self.log_freq = log_freq
         self.episode_count = 0
         self.last_print = time.time()
 
+        # Stored time series
+        self.timesteps = []
+        self.total_completed_series = []          # total completions per episode
+        self.total_assigned_series = []           # total assignments per episode
+        self.total_failed_series = []             # total failures per episode
+        self.success_rate_mean_series = []        # mean over agents per episode
+        self.per_agent_completed_series = []      # list per episode -> list per agent
+        self.coverage_assigned_series = []        # fraction of waypoints assigned at least once
+        self.coverage_completed_series = []       # fraction of waypoints completed at least once
+
     def _on_step(self) -> bool:
         dones = self.locals.get("dones")
         infos = self.locals.get("infos", [])
         if dones is None:
             return True
+
         for i, d in enumerate(dones):
             if d:
                 self.episode_count += 1
                 total_completed = 0
-                per_agent = []
+                total_assigned = 0
+                total_failed = 0
+                per_agent_completed = []
+                per_agent_success_rates = []
+
                 if i < len(infos) and infos[i]:
                     for k, v in sorted(infos[i].items()):
                         if k.startswith("agent_") and isinstance(v, dict):
-                            c = v.get("waypoints_completed", 0)
+                            c = int(v.get("waypoints_completed", 0))
+                            a = int(v.get("waypoints_assigned", 0))
+                            f = int(v.get("waypoints_failed", 0))
                             total_completed += c
-                            per_agent.append(c)
-                # Log scalar metrics
+                            total_assigned += a
+                            total_failed += f
+                            per_agent_completed.append(c)
+                            sr = (c / a) if a > 0 else 0.0
+                            per_agent_success_rates.append(sr)
+
+                # Persist series for plotting
+                self.timesteps.append(self.num_timesteps)
+                self.total_completed_series.append(total_completed)
+                self.total_assigned_series.append(total_assigned)
+                self.total_failed_series.append(total_failed)
+                self.per_agent_completed_series.append(per_agent_completed)
+                # Waypoint coverage metrics if env provided waypoint_counts
+                coverage_assigned = 0.0
+                coverage_completed = 0.0
+                wc = infos[i].get('waypoint_counts') if (i < len(infos) and infos[i]) else None
+                if isinstance(wc, dict):
+                    a_arr = np.asarray(wc.get('assigned', []), dtype=np.int32)
+                    c_arr = np.asarray(wc.get('completed', []), dtype=np.int32)
+                    if a_arr.size > 0:
+                        coverage_assigned = float(np.count_nonzero(a_arr > 0) / a_arr.size)
+                    if c_arr.size > 0:
+                        coverage_completed = float(np.count_nonzero(c_arr > 0) / c_arr.size)
+                self.coverage_assigned_series.append(coverage_assigned)
+                self.coverage_completed_series.append(coverage_completed)
+                if per_agent_success_rates:
+                    self.success_rate_mean_series.append(float(np.mean(per_agent_success_rates)))
+                else:
+                    self.success_rate_mean_series.append(0.0)
+
+                # Log scalar metrics periodically
                 if self.episode_count % self.log_freq == 0:
                     self.logger.record("waypoints/total_completed", total_completed)
-                    if per_agent:
-                        self.logger.record("waypoints/mean_per_agent", float(np.mean(per_agent)))
-                        self.logger.record("waypoints/std_per_agent", float(np.std(per_agent)))
+                    self.logger.record("waypoints/total_assigned", total_assigned)
+                    self.logger.record("waypoints/total_failed", total_failed)
+                    if per_agent_completed:
+                        self.logger.record("waypoints/mean_completed_per_agent", float(np.mean(per_agent_completed)))
+                        self.logger.record("waypoints/std_completed_per_agent", float(np.std(per_agent_completed)))
+                    self.logger.record("waypoints/success_rate_mean", self.success_rate_mean_series[-1])
+                    self.logger.record("waypoints/coverage_assigned", self.coverage_assigned_series[-1])
+                    self.logger.record("waypoints/coverage_completed", self.coverage_completed_series[-1])
+
                 # Throttled print
                 if self.verbose and (time.time() - self.last_print) > 10:
-                    print(f"[TRAIN] episodes={self.episode_count}  "
-                          f"total_completed={total_completed}  per_agent={per_agent}")
+                    print(
+                        f"[TRAIN] episodes={self.episode_count}  "
+                        f"completed_total={total_completed}  assigned_total={total_assigned}  failed_total={total_failed}  "
+                        f"success_rate_mean={self.success_rate_mean_series[-1]:.2f}  per_agent_completed={per_agent_completed}"
+                    )
                     self.last_print = time.time()
         return True
 
@@ -309,6 +364,56 @@ def plot_reward_stats(rewards, timesteps, save_path):
     plt.close()
     print(f"[PLOT] Reward statistics plot saved to {os.path.join(save_path, 'reward_statistics.png')}")
 
+def plot_waypoint_metrics(timesteps, total_completed, per_agent_completed_series,
+                          total_assigned, total_failed, success_rate_mean,
+                          save_path, title="Waypoint Metrics"):
+    """Plot waypoint-related training metrics and save as PNG."""
+    if not timesteps:
+        return
+
+    # Prepare x-axis
+    x = np.array(timesteps)
+
+    plt.figure(figsize=(14, 10))
+
+    # (1) Total completions over time
+    plt.subplot(2, 2, 1)
+    plt.plot(x, total_completed, 'g-', label='Total completions/ep')
+    if len(total_completed) > 10:
+        w = max(5, len(total_completed)//20)
+        ma = np.convolve(total_completed, np.ones(w)/w, mode='valid')
+        plt.plot(x[w-1:], ma, 'k--', alpha=0.8, label=f'MA (w={w})')
+    plt.xlabel('Timesteps'); plt.ylabel('Completions'); plt.title('Waypoint Completions'); plt.grid(True, alpha=0.3); plt.legend()
+
+    # (2) Success rate (mean across agents)
+    plt.subplot(2, 2, 2)
+    sr = np.array(success_rate_mean)
+    plt.plot(x, sr, 'b-')
+    plt.ylim(0.0, 1.05)
+    plt.xlabel('Timesteps'); plt.ylabel('Success rate'); plt.title('Mean Success Rate'); plt.grid(True, alpha=0.3)
+
+    # (3) Per-agent completions (lines)
+    plt.subplot(2, 2, 3)
+    if per_agent_completed_series and per_agent_completed_series[0]:
+        n_agents = len(per_agent_completed_series[0])
+        for a in range(n_agents):
+            series = [row[a] if a < len(row) else 0 for row in per_agent_completed_series]
+            plt.plot(x, series, label=f'agent_{a}')
+        plt.legend(ncol=2, fontsize=8)
+    plt.xlabel('Timesteps'); plt.ylabel('Completions'); plt.title('Per-Agent Completions'); plt.grid(True, alpha=0.3)
+
+    # (4) Assigned vs failed per episode
+    plt.subplot(2, 2, 4)
+    plt.plot(x, total_assigned, 'c-', label='Assigned/ep')
+    plt.plot(x, total_failed, 'r-', label='Failed/ep')
+    plt.xlabel('Timesteps'); plt.ylabel('Count'); plt.title('Assigned vs Failed'); plt.grid(True, alpha=0.3); plt.legend()
+
+    plt.tight_layout()
+    out_path = os.path.join(save_path, 'waypoint_metrics.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[PLOT] Waypoint metrics plot saved to {out_path}")
+
 # --------------------------
 # Env factory
 # --------------------------
@@ -381,11 +486,14 @@ def parse_args():
     p.add_argument("--eval-freq", type=int, default=10_000)
     p.add_argument("--eval-episodes", type=int, default=5)
     p.add_argument("--target-reward", type=float, default=100.0, help="Target reward for early stopping")
+    p.add_argument("--early-stop-on-reward", action="store_true", help="Stop when average eval reward >= target")
+    p.add_argument("--eval-deterministic", action="store_true", help="Use deterministic policy for evaluation")
 
     # Quick smoke test
     p.add_argument("--quick", action="store_true", help="Reduced settings for a fast test run")
     p.add_argument("--verbose", action="store_true", help="Enable verbose logging for debugging")
-    p.add_argument("--plot-rewards", action="store_true", help="Generate reward progression plots after training")
+    p.add_argument("--plot-rewards", action="store_true", help="Generate reward and waypoint plots after training")
+    p.add_argument("--plot-metrics", action="store_true", help="Alias for --plot-rewards")
 
     return p.parse_args()
 
@@ -394,6 +502,10 @@ def parse_args():
 # --------------------------
 def main():
     args = parse_args()
+    
+    # Back-compat alias
+    if args.plot_metrics:
+        args.plot_rewards = True
 
     # Quick mode
     if args.quick:
@@ -468,7 +580,8 @@ def main():
 
     # Rolling train printer + custom waypoint metrics
     callbacks.append(RolloutPrinter())
-    callbacks.append(WaypointTrainingCallback(verbose=1, log_freq=100))
+    waypoint_cb = WaypointTrainingCallback(verbose=1, log_freq=100)
+    callbacks.append(waypoint_cb)
 
     # Checkpoints (also save VecNormalize)
     callbacks.append(CheckpointCallback(
@@ -479,18 +592,21 @@ def main():
         save_vecnormalize=True
     ))
 
-    # Periodic evaluation during training (DURING, not after)
-    #callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=args.target_reward, verbose=1)
-    #callbacks.append(EvalCallback(
-    #    eval_env,
-    #    callback_on_new_best=callback_on_best,
-    #    best_model_save_path=args.save_path,
-    #    log_path=args.save_path,
-    #    eval_freq=args.eval_freq,
-    #    n_eval_episodes=args.eval_episodes,
-    #    deterministic=True,
-    #    render=False
-    #))
+    # Periodic evaluation during training (DURING). Saves best_model.zip
+    callback_on_best = None
+    if args.early_stop_on_reward:
+        callback_on_best = StopTrainingOnRewardThreshold(reward_threshold=args.target_reward, verbose=1)
+    eval_cb = EvalCallback(
+        eval_env,
+        callback_on_new_best=callback_on_best,
+        best_model_save_path=args.save_path,
+        log_path=args.save_path,
+        eval_freq=args.eval_freq,
+        n_eval_episodes=args.eval_episodes,
+        deterministic=args.eval_deterministic,
+        render=False
+    )
+    callbacks.append(eval_cb)
 
     # ---------- Train ----------
     print("\n" + "="*60)
@@ -531,6 +647,39 @@ def main():
         }
         np.savez(os.path.join(args.save_path, 'reward_data.npz'), **reward_data)
         print(f"[SAVE] Raw reward data saved to {os.path.join(args.save_path, 'reward_data.npz')}")
+
+        # Waypoint metrics plots
+        if waypoint_cb.timesteps:
+            print("[PLOT] Generating waypoint metrics plots...")
+            plot_waypoint_metrics(
+                timesteps=waypoint_cb.timesteps,
+                total_completed=waypoint_cb.total_completed_series,
+                per_agent_completed_series=waypoint_cb.per_agent_completed_series,
+                total_assigned=waypoint_cb.total_assigned_series,
+                total_failed=waypoint_cb.total_failed_series,
+                success_rate_mean=waypoint_cb.success_rate_mean_series,
+                save_path=args.save_path,
+                title="MARL Waypoint Metrics"
+            )
+
+            # Save raw waypoint metrics
+            # Convert per-agent list of lists to padded ndarray for saving
+            max_agents = max((len(row) for row in waypoint_cb.per_agent_completed_series), default=0)
+            per_agent_arr = np.zeros((len(waypoint_cb.per_agent_completed_series), max_agents), dtype=np.int32)
+            for idx, row in enumerate(waypoint_cb.per_agent_completed_series):
+                for j, val in enumerate(row):
+                    per_agent_arr[idx, j] = val
+
+            wp_metrics = {
+                'timesteps': np.array(waypoint_cb.timesteps, dtype=np.int64),
+                'total_completed': np.array(waypoint_cb.total_completed_series, dtype=np.int32),
+                'total_assigned': np.array(waypoint_cb.total_assigned_series, dtype=np.int32),
+                'total_failed': np.array(waypoint_cb.total_failed_series, dtype=np.int32),
+                'success_rate_mean': np.array(waypoint_cb.success_rate_mean_series, dtype=np.float32),
+                'per_agent_completed': per_agent_arr
+            }
+            np.savez(os.path.join(args.save_path, 'waypoint_metrics.npz'), **wp_metrics)
+            print(f"[SAVE] Waypoint metrics saved to {os.path.join(args.save_path, 'waypoint_metrics.npz')}")
 
     #### Print training progression ############################
     eval_file = os.path.join(args.save_path, 'evaluations.npz')

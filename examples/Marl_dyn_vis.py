@@ -13,6 +13,7 @@ import os
 import sys
 import time
 from typing import Dict, Optional
+import matplotlib.pyplot as plt
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -134,6 +135,7 @@ class DroneVisualizer:
         self.policy = None
         self.wrapped_env = None       # Flattened wrapper for random path (action sampling)
         self.episode_stats = []
+        self._debug_last_ids = []     # store debug text/line ids when overlay enabled
 
         if self.using_model:
             self._setup_model_path()
@@ -247,6 +249,8 @@ class DroneVisualizer:
         step = 0
         ep_reward = 0.0
         last_completions = {}
+        last_assigned = {}
+        last_failed = {}
 
         if self.using_model:
             obs = self.vec.reset()
@@ -257,29 +261,95 @@ class DroneVisualizer:
                 r = float(rewards[0])
                 ep_reward += r
                 done = bool(dones[0])
+                step += 1
 
                 if infos and infos[0]:
                     info0 = infos[0]
                     for k, v in info0.items():
                         if isinstance(v, dict) and k.startswith("agent_"):
                             last_completions[k] = int(v.get("waypoints_completed", last_completions.get(k, 0)))
+                            last_assigned[k] = int(v.get("waypoints_assigned", last_assigned.get(k, 0)))
+                            last_failed[k] = int(v.get("waypoints_failed", last_failed.get(k, 0)))
 
                 if self.args.slow_motion:
                     time.sleep(self.args.step_delay)
+
+                # Debug overlay: annotate drones and highlight target lines
+                if getattr(self.args, 'debug_overlay', False):
+                    try:
+                        self._draw_debug_overlay()
+                    except Exception as e:
+                        print(f"[VIS][DEBUG] overlay error: {e}")
         
 
         total_completions = int(sum(last_completions.values())) if last_completions else 0
         per_agent = [last_completions.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
+        per_agent_assigned = [last_assigned.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
+        per_agent_failed = [last_failed.get(f"agent_{i}", 0) for i in range(self.args.num_drones)]
+        success_rates = [ (c/a) if a > 0 else 0.0 for c, a in zip(per_agent, per_agent_assigned) ]
+        mean_success = float(np.mean(success_rates)) if success_rates else 0.0
+        duration_sec = step / float(self.args.ctrl_freq) if self.args.ctrl_freq > 0 else 0.0
+        completions_per_min = (total_completions / duration_sec * 60.0) if duration_sec > 0 else 0.0
         stats = {
             "episode": episode_idx,
             "reward": ep_reward,
             "total_completions": total_completions,
-            "per_agent": per_agent
+            "per_agent": per_agent,
+            "per_agent_assigned": per_agent_assigned,
+            "per_agent_failed": per_agent_failed,
+            "success_rate_mean": mean_success,
+            "steps": step,
+            "duration_sec": duration_sec,
+            "completions_per_min": completions_per_min
         }
 
         print(f"[EP {episode_idx}] return={ep_reward:.2f}  "
               f"completed_total={total_completions}  per_agent={per_agent}")
         return stats
+
+    def _draw_debug_overlay(self):
+        """Draw per-drone text with target, hold, dist, and a line to target."""
+        # Remove previous items (lifeTime would auto-expire but keep tidy if step_delay large)
+        for uid in self._debug_last_ids:
+            try:
+                p.removeUserDebugItem(uid)
+            except Exception:
+                pass
+        self._debug_last_ids = []
+
+        # Access underlying env
+        client_id = self.vec.get_attr('CLIENT')[0]
+        agent_targets = self.vec.get_attr('agent_target_waypoint')[0]
+        holds = self.vec.get_attr('agent_hold_counter')[0]
+        waypoint_pool = self.vec.get_attr('waypoint_pool')[0]
+
+        n = len(agent_targets)
+        for i in range(n):
+            # Drone pos
+            state = self.vec.env_method('_getDroneStateVector', i)[0]
+            pos = np.array(state[0:3])
+            tgt_idx = int(agent_targets[i])
+            hold = int(holds[i])
+            dist = None
+            tgt_pos = None
+            if 0 <= tgt_idx < waypoint_pool.shape[0]:
+                tgt_pos = waypoint_pool[tgt_idx]
+                dist = float(np.linalg.norm(pos - tgt_pos))
+            # Text above drone
+            txt = f"A{i} tgt={tgt_idx} hold={hold}" + (f" d={dist:.2f}" if dist is not None else "")
+            uid = p.addUserDebugText(txt, pos + np.array([0,0,0.4]),
+                                     textColorRGB=[1,1,0],
+                                     textSize=1.2,
+                                     lifeTime=self.args.step_delay if self.args.slow_motion else 0.03,
+                                     physicsClientId=client_id)
+            self._debug_last_ids.append(uid)
+
+            # Line to target
+            if getattr(self.args, 'highlight_lines', False) and tgt_pos is not None:
+                uid2 = p.addUserDebugLine(pos, tgt_pos, [0,1,0], lineWidth=2,
+                                          lifeTime=self.args.step_delay if self.args.slow_motion else 0.03,
+                                          physicsClientId=client_id)
+                self._debug_last_ids.append(uid2)
 
     # ---------- Multi-episode driver ----------
     def run(self):
@@ -309,6 +379,65 @@ class DroneVisualizer:
                 print(f"Avg return: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
                 print(f"Avg completions: {np.mean(totals):.2f} ± {np.std(totals):.2f}")
                 print(f"Max completions: {max(totals)} | Min: {min(totals)}")
+
+                # Save plots and raw data
+                out_dir = getattr(self.args, 'out_dir', CURRENT_DIR)
+                os.makedirs(out_dir, exist_ok=True)
+
+                # Plot rewards per episode
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.plot(rewards, 'b-o', alpha=0.8)
+                plt.xlabel('Episode'); plt.ylabel('Return'); plt.title('Return per Episode'); plt.grid(True, alpha=0.3)
+
+                # Plot completions per episode
+                plt.subplot(1, 2, 2)
+                plt.plot(totals, 'g-o', alpha=0.8)
+                plt.xlabel('Episode'); plt.ylabel('Total Completions'); plt.title('Completions per Episode'); plt.grid(True, alpha=0.3)
+                out_path = os.path.join(out_dir, 'vis_episode_metrics.png')
+                plt.tight_layout(); plt.savefig(out_path, dpi=150, bbox_inches='tight'); plt.close()
+                print(f"[VIS][PLOT] Saved {out_path}")
+
+                # Detailed waypoint metrics if available
+                suc = [s.get("success_rate_mean", 0.0) for s in self.episode_stats]
+                cpm = [s.get("completions_per_min", 0.0) for s in self.episode_stats]
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                plt.plot(suc, 'm-o'); plt.ylim(0, 1.05)
+                plt.xlabel('Episode'); plt.ylabel('Mean Success Rate'); plt.title('Success Rate per Episode'); plt.grid(True, alpha=0.3)
+                plt.subplot(1, 2, 2)
+                plt.plot(cpm, 'c-o')
+                plt.xlabel('Episode'); plt.ylabel('Completions/min'); plt.title('Completions per Minute'); plt.grid(True, alpha=0.3)
+                out_path2 = os.path.join(out_dir, 'vis_waypoint_metrics.png')
+                plt.tight_layout(); plt.savefig(out_path2, dpi=150, bbox_inches='tight'); plt.close()
+                print(f"[VIS][PLOT] Saved {out_path2}")
+
+                # Save raw data
+                # Pad per-agent arrays to max agent count
+                max_agents = max((len(s.get('per_agent', [])) for s in self.episode_stats), default=0)
+                per_agent = np.zeros((len(self.episode_stats), max_agents), dtype=np.int32)
+                per_agent_assigned = np.zeros_like(per_agent)
+                per_agent_failed = np.zeros_like(per_agent)
+                for i, s in enumerate(self.episode_stats):
+                    row = s.get('per_agent', [])
+                    row_a = s.get('per_agent_assigned', [])
+                    row_f = s.get('per_agent_failed', [])
+                    for j in range(min(max_agents, len(row))):
+                        per_agent[i, j] = row[j]
+                    for j in range(min(max_agents, len(row_a))):
+                        per_agent_assigned[i, j] = row_a[j]
+                    for j in range(min(max_agents, len(row_f))):
+                        per_agent_failed[i, j] = row_f[j]
+                out_npz = os.path.join(out_dir, 'vis_metrics.npz')
+                np.savez(out_npz,
+                         rewards=np.array(rewards, dtype=np.float32),
+                         total_completions=np.array(totals, dtype=np.int32),
+                         per_agent_completed=per_agent,
+                         per_agent_assigned=per_agent_assigned,
+                         per_agent_failed=per_agent_failed,
+                         success_rate_mean=np.array(suc, dtype=np.float32),
+                         completions_per_min=np.array(cpm, dtype=np.float32))
+                print(f"[VIS][SAVE] Saved raw metrics to {out_npz}")
 
 
 # -----------------------------------------------------------------------------
@@ -346,6 +475,9 @@ def parse_args():
     p.add_argument("--no-shadows", action="store_true")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--record", action="store_true")
+    p.add_argument("--debug-overlay", action="store_true", help="Draw per-drone debug text and target lines")
+    p.add_argument("--highlight-lines", action="store_true", help="Draw a line from drone to its target waypoint")
+    p.add_argument("--out-dir", type=str, default=CURRENT_DIR, help="Directory to save plots & metrics")
 
     return p.parse_args()
 

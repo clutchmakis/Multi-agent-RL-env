@@ -72,8 +72,8 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Workspace bounds for waypoint generation
         if workspace_bounds is None:
             self.workspace_bounds = (
-                np.array([-50.0, -50.0, 5], dtype=np.float32),
-                np.array([50, 50, 25], dtype=np.float32)
+                np.array([-5.0, -5.0, 0.5], dtype=np.float32),
+                np.array([5, 5, 2.5], dtype=np.float32)
             )
         else:
             self.workspace_bounds = (
@@ -94,10 +94,18 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self.waypoint_owner = np.full(self.num_waypoints, -1, dtype=np.int32)  # -1 means no owner
         self.agent_target_waypoint = np.full(self.num_drones, -1, dtype=np.int32)  # -1 means no target
         self.agent_waypoints_completed = {f"agent_{i}": 0 for i in range(num_drones)}
+        # Additional per-episode metrics
+        self.agent_waypoints_assigned = {f"agent_{i}": 0 for i in range(num_drones)}
+        self.agent_waypoints_failed = {f"agent_{i}": 0 for i in range(num_drones)}
         self.agent_hold_counter = np.zeros(self.num_drones, dtype=np.int32)
         self.agent_last_action = {f"agent_{i}": np.zeros(3, dtype=np.float32) for i in range(num_drones)}
         # Track last distance-to-target per agent (for progress shaping)
         self._prev_dist = np.full(self.num_drones, np.inf, dtype=np.float32)
+
+        # Per-waypoint episode counters (for diagnostics & coverage)
+        self._wp_assigned_counts = np.zeros(self.num_waypoints, dtype=np.int32)
+        self._wp_completed_counts = np.zeros(self.num_waypoints, dtype=np.int32)
+        self._wp_failed_counts = np.zeros(self.num_waypoints, dtype=np.int32)
 
         # Priority queue for waypoint assignment (agent indices)
         self.priority_queue = list(range(self.num_drones))
@@ -244,6 +252,9 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             self.waypoint_status[waypoint_idx] = WaypointStatus.CLAIMED
             self.waypoint_owner[waypoint_idx] = agent_id
             self.agent_target_waypoint[agent_id] = waypoint_idx
+            # Track assignment attempt
+            self.agent_waypoints_assigned[f"agent_{agent_id}"] += 1
+            self._wp_assigned_counts[waypoint_idx] += 1
             
             if self.verbose:
                 self._log(f"[AGENT {agent_id}] Claimed waypoint {waypoint_idx}")
@@ -445,6 +456,10 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                 self._last_dist_to_target[i] = d
 
                 if self._stagnant_steps[i] > 60:  # ~2s @30Hz
+                    # Consider this an unsuccessful attempt to complete the waypoint
+                    self.agent_waypoints_failed[f"agent_{i}"] += 1
+                    if 0 <= target_i < self.num_waypoints:
+                        self._wp_failed_counts[target_i] += 1
                     self._releaseWaypoint(target_i)
                     self._globalAssign()
                     self._stagnant_steps[i] = 0
@@ -462,6 +477,8 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
 
                 # Release current waypoint and optionally reassign globally
                 self._releaseWaypoint(old_target)
+                if 0 <= old_target < self.num_waypoints:
+                    self._wp_completed_counts[old_target] += 1
                 self._globalAssign()
 
                 # Reset hold counter
@@ -789,10 +806,19 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             
             info[agent_key] = {
                 "waypoints_completed": self.agent_waypoints_completed[agent_key],
+                "waypoints_assigned": self.agent_waypoints_assigned[agent_key],
+                "waypoints_failed": self.agent_waypoints_failed[agent_key],
                 "current_target": target_idx,
                 "available_waypoints": int(np.sum(self.waypoint_status == WaypointStatus.AVAILABLE)),
                 "position": self._getDroneStateVector(i)[0:3].copy()
             }
+
+        # Add per-episode waypoint summary (arrays) for diagnostics
+        info["waypoint_counts"] = {
+            "assigned": self._wp_assigned_counts.copy(),
+            "completed": self._wp_completed_counts.copy(),
+            "failed": self._wp_failed_counts.copy()
+        }
         
         return info
     
@@ -804,6 +830,11 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         self.agent_target_waypoint[:] = -1
         self.agent_hold_counter[:] = 0
         self.agent_waypoints_completed = {f"agent_{i}": 0 for i in range(self.num_drones)}
+        self.agent_waypoints_assigned = {f"agent_{i}": 0 for i in range(self.num_drones)}
+        self.agent_waypoints_failed = {f"agent_{i}": 0 for i in range(self.num_drones)}
+        self._wp_assigned_counts[:] = 0
+        self._wp_completed_counts[:] = 0
+        self._wp_failed_counts[:] = 0
         
         # Reset progress tracker
         self._prev_dist[:] = np.inf
