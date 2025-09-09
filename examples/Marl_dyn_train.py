@@ -475,7 +475,7 @@ def parse_args():
 
     # PPO
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--n-steps", type=int, default=2048)
+    p.add_argument("--n-steps", type=int, default=409600)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--n-epochs", type=int, default=10)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -486,8 +486,8 @@ def parse_args():
     p.add_argument("--max-grad-norm", type=float, default=0.5)
 
     # Env
-    p.add_argument("--num-drones", type=int, default=4)
-    p.add_argument("--num-waypoints", type=int, default=20)
+    p.add_argument("--num-drones", type=int, default=5)
+    p.add_argument("--num-waypoints", type=int, default=200)
     p.add_argument("--episode-len", type=int, default=3000)
     p.add_argument("--waypoint-radius", type=float, default=0.5)
     p.add_argument("--waypoint-hold-steps", type=int, default=5)
