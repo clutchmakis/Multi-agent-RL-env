@@ -116,7 +116,8 @@ class FlattenDictWrapper(gym.Wrapper):
     def step(self, action):
         action_dict = self._unflatten_action(action)
         obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict = self.env.step(action_dict)
-        total_reward = float(sum(reward_dict.values()))
+        # Average reward across agents for display consistency
+        total_reward = float(sum(reward_dict.values()) / max(1, self.num_agents))
         done = bool(any(terminated_dict.values()))
         truncated = bool(any(truncated_dict.values()))
         return self._flatten_obs(obs_dict), total_reward, done, truncated, info_dict
@@ -240,6 +241,31 @@ class DroneVisualizer:
     def _update_waypoint_colors(self):
         return
 
+    # ---------- Follow-camera updater ----------
+    def _update_follow_camera(self):
+        """If enabled, reposition the camera to follow a selected agent."""
+        idx = getattr(self.args, "follow_agent", -1)
+        if not self.using_model or idx is None or idx < 0:
+            return
+        try:
+            client_id = self.vec.get_attr('CLIENT')[0]
+            # Clamp index to available agents
+            n_agents = len(self.vec.get_attr('agent_target_waypoint')[0])
+            if n_agents <= 0:
+                return
+            idx = max(0, min(idx, n_agents - 1))
+            state = self.vec.env_method('_getDroneStateVector', idx)[0]
+            pos = np.array(state[0:3])
+            p.resetDebugVisualizerCamera(
+                cameraDistance=getattr(self.args, 'follow_distance', 8.0),
+                cameraYaw=getattr(self.args, 'follow_yaw', 45.0),
+                cameraPitch=getattr(self.args, 'follow_pitch', -30.0),
+                cameraTargetPosition=(pos + np.array([0, 0, getattr(self.args, 'follow_offset_z', 0.4)])).tolist(),
+                physicsClientId=client_id
+            )
+        except Exception as e:
+            if getattr(self.args, "verbose", False):
+                print(f"[VIS][FOLLOW] camera update failed: {e}")
     # ---------- Episode loop ----------
     def run_episode(self, episode_idx: int):
         """Run a single episode in GUI, return stats dict."""
@@ -248,11 +274,17 @@ class DroneVisualizer:
         last_completions = {}
         last_assigned = {}
         last_failed = {}
+        # Track distance traveled per agent and average distance-to-target
+        num_agents = int(self.args.num_drones)
+        prev_positions = None
+        dist_traveled = np.zeros(num_agents, dtype=np.float64)
+        avg_target_dist_sum = 0.0
+        avg_target_dist_count = 0
 
         if self.using_model:
             # Reset with waypoint regeneration to ensure fresh pool each episode
             try:
-                obs = self.vec.reset(options={"regenerate_waypoints": True})
+                obs = self.vec.reset(options={"regenerate_waypoints": False})
             except TypeError:
                 # Older VecEnv signature without options support
                 obs = self.vec.reset()
@@ -264,6 +296,27 @@ class DroneVisualizer:
                 ep_reward += r
                 done = bool(dones[0])
                 step += 1
+
+                # Update distances
+                try:
+                    positions = []
+                    for i in range(num_agents):
+                        state_i = self.vec.env_method('_getDroneStateVector', i)[0]
+                        positions.append(np.array(state_i[0:3], dtype=np.float64))
+                    if prev_positions is not None:
+                        for i in range(num_agents):
+                            dist_traveled[i] += float(np.linalg.norm(positions[i] - prev_positions[i]))
+                    prev_positions = positions
+                    # Avg distance to current target across agents with a valid target
+                    agent_targets = self.vec.get_attr('agent_target_waypoint')[0]
+                    waypoint_pool = self.vec.get_attr('waypoint_pool')[0]
+                    for i in range(num_agents):
+                        tgt = int(agent_targets[i])
+                        if 0 <= tgt < waypoint_pool.shape[0]:
+                            avg_target_dist_sum += float(np.linalg.norm(positions[i] - waypoint_pool[tgt]))
+                            avg_target_dist_count += 1
+                except Exception:
+                    pass
 
                 if infos and infos[0]:
                     info0 = infos[0]
@@ -282,6 +335,9 @@ class DroneVisualizer:
                         self._draw_debug_overlay()
                     except Exception as e:
                         print(f"[VIS][DEBUG] overlay error: {e}")
+                # Optional: follow-camera
+                if getattr(self.args, 'follow_agent', -1) >= 0:
+                    self._update_follow_camera()
         
 
         total_completions = int(sum(last_completions.values())) if last_completions else 0
@@ -293,6 +349,9 @@ class DroneVisualizer:
         mean_success = float(np.mean(success_rates)) if success_rates else 0.0
         duration_sec = step / float(self.args.ctrl_freq) if self.args.ctrl_freq > 0 else 0.0
         completions_per_min = (total_completions / duration_sec * 60.0) if duration_sec > 0 else 0.0
+        total_failed = int(sum(per_agent_failed))
+        total_distance = float(np.sum(dist_traveled))
+        avg_target_distance = float(avg_target_dist_sum / avg_target_dist_count) if avg_target_dist_count > 0 else 0.0
         
         stats = {
             "episode": episode_idx,
@@ -304,11 +363,19 @@ class DroneVisualizer:
             "success_rate_mean": mean_success,
             "steps": step,
             "duration_sec": duration_sec,
-            "completions_per_min": completions_per_min
+            "completions_per_min": completions_per_min,
+            "total_failed": total_failed,
+            "distance_traveled_total": total_distance,
+            "distance_traveled_per_agent": dist_traveled.tolist(),
+            "avg_target_distance": avg_target_distance
         }
 
-        print(f"[EP {episode_idx}] return={ep_reward:.2f}  "
-              f"completed_total={total_completions}  per_agent={per_agent}")
+        print(
+            f"[EP {episode_idx}] return={ep_reward:.2f}  "
+            f"completed_total={total_completions}  failed_total={total_failed}  "
+            f"success_mean={mean_success:.2f}  dist_total={total_distance:.1f}m  "
+            f"avg_tgt_dist={avg_target_distance:.2f}m  time={duration_sec:.1f}s"
+        )
         return stats
 
     def _draw_debug_overlay(self):
@@ -405,6 +472,10 @@ class DroneVisualizer:
                 # Detailed waypoint metrics if available
                 suc = [s.get("success_rate_mean", 0.0) for s in self.episode_stats]
                 cpm = [s.get("completions_per_min", 0.0) for s in self.episode_stats]
+                durations = [s.get("duration_sec", 0.0) for s in self.episode_stats]
+                total_faileds = [s.get("total_failed", 0) for s in self.episode_stats]
+                total_dist = [s.get("distance_traveled_total", 0.0) for s in self.episode_stats]
+                avg_tgt_dist = [s.get("avg_target_distance", 0.0) for s in self.episode_stats]
                 plt.figure(figsize=(12, 5))
                 plt.subplot(1, 2, 1)
                 plt.plot(suc, 'm-o'); plt.ylim(0, 1.05)
@@ -422,16 +493,20 @@ class DroneVisualizer:
                 per_agent = np.zeros((len(self.episode_stats), max_agents), dtype=np.int32)
                 per_agent_assigned = np.zeros_like(per_agent)
                 per_agent_failed = np.zeros_like(per_agent)
+                per_agent_distance = np.zeros((len(self.episode_stats), max_agents), dtype=np.float32)
                 for i, s in enumerate(self.episode_stats):
                     row = s.get('per_agent', [])
                     row_a = s.get('per_agent_assigned', [])
                     row_f = s.get('per_agent_failed', [])
+                    row_d = s.get('distance_traveled_per_agent', [])
                     for j in range(min(max_agents, len(row))):
                         per_agent[i, j] = row[j]
                     for j in range(min(max_agents, len(row_a))):
                         per_agent_assigned[i, j] = row_a[j]
                     for j in range(min(max_agents, len(row_f))):
                         per_agent_failed[i, j] = row_f[j]
+                    for j in range(min(max_agents, len(row_d))):
+                        per_agent_distance[i, j] = float(row_d[j])
                 out_npz = os.path.join(out_dir, 'vis_metrics.npz')
                 np.savez(out_npz,
                          rewards=np.array(rewards, dtype=np.float32),
@@ -439,8 +514,13 @@ class DroneVisualizer:
                          per_agent_completed=per_agent,
                          per_agent_assigned=per_agent_assigned,
                          per_agent_failed=per_agent_failed,
+                         per_agent_distance=per_agent_distance,
                          success_rate_mean=np.array(suc, dtype=np.float32),
-                         completions_per_min=np.array(cpm, dtype=np.float32))
+                         completions_per_min=np.array(cpm, dtype=np.float32),
+                         total_failed=np.array(total_faileds, dtype=np.int32),
+                         duration_sec=np.array(durations, dtype=np.float32),
+                         distance_traveled_total=np.array(total_dist, dtype=np.float32),
+                         avg_target_distance=np.array(avg_tgt_dist, dtype=np.float32))
                 print(f"[VIS][SAVE] Saved raw metrics to {out_npz}")
             else:
                 # Still produce placeholder graphs if requested to always create graphs
@@ -484,10 +564,10 @@ def parse_args():
 
     # Env params (must match training for best results)
     p.add_argument("--num-drones", type=int, default=4)
-    p.add_argument("--num-waypoints", type=int, default=20)
-    p.add_argument("--episode-len", type=int, default=120)
+    p.add_argument("--num-waypoints", type=int, default=50)
+    p.add_argument("--episode-len", type=int, default=3000)
     p.add_argument("--waypoint-radius", type=float, default=0.5)
-    p.add_argument("--waypoint-hold-steps", type=int, default=5)
+    p.add_argument("--waypoint-hold-steps", type=int, default=50)
     p.add_argument("--priority-mode", type=str, default="distance",
                    choices=["sequential", "distance", "random"])
     p.add_argument("--min-waypoint-separation", type=float, default=2.0)
@@ -509,6 +589,17 @@ def parse_args():
     p.add_argument("--record", action="store_true")
     p.add_argument("--debug-overlay", action="store_true", help="Draw per-drone debug text and target lines")
     p.add_argument("--highlight-lines", action="store_true", help="Draw a line from drone to its target waypoint")
+    # Follow-camera options
+    p.add_argument("--follow-agent", type=int, default=-1,
+                   help="Agent index to follow with the camera (-1 disables)")
+    p.add_argument("--follow-distance", type=float, default=2.0,
+                   help="Camera distance when following")
+    p.add_argument("--follow-yaw", type=float, default=45.0,
+                   help="Camera yaw when following")
+    p.add_argument("--follow-pitch", type=float, default=-30.0,
+                   help="Camera pitch when following")
+    p.add_argument("--follow-offset-z", type=float, default=0.4,
+                   help="Vertical offset above drone for camera target")
     p.add_argument("--out-dir", type=str, default=CURRENT_DIR, help="Directory to save plots & metrics")
 
     return p.parse_args()

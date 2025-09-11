@@ -113,3 +113,4 @@ examples/models/
 *.zip
 *.pkl
 *.npz
+*.png

@@ -20,6 +20,7 @@ import sys
 import time
 import random
 from typing import Dict, Any
+from collections import deque
 import numpy as np
 import matplotlib.pyplot as plt
 import gymnasium as gym
@@ -117,8 +118,8 @@ class FlattenDictWrapper(gym.Wrapper):
         action_dict = self._unflatten_action(action)
         obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict = self.env.step(action_dict)
 
-        # Sum rewards from all agents
-        total_reward = float(sum(reward_dict.values()))
+        # Average reward across agents (more interpretable scale)
+        total_reward = float(sum(reward_dict.values()) / max(1, self.num_agents))
 
         # Episode ends if ANY agent is done (centralized termination)
         done = bool(any(terminated_dict.values()))
@@ -129,18 +130,50 @@ class FlattenDictWrapper(gym.Wrapper):
 # Small printer for training metrics
 # --------------------------
 class RolloutPrinter(BaseCallback):
-    """Print moving episode stats from VecMonitor at end of each rollout."""
+    """Print moving episode stats using NORMALIZED rewards.
+
+    We accumulate per-env normalized rewards via callback locals['rewards'] and
+    finalize them when `dones` is True. This avoids relying on VecMonitor's
+    pre-normalization buffer.
+    """
+    def __init__(self, window:int = 100, verbose: int = 0):
+        super().__init__(verbose)
+        self.window = int(max(1, window))
+        self._acc = None  # type: ignore
+        self._recent_returns = deque(maxlen=self.window)
+        self._recent_lengths = deque(maxlen=self.window)
+
+    def _on_training_start(self) -> None:
+        n_envs = getattr(self.training_env, 'num_envs', 1)
+        self._acc = [0.0 for _ in range(n_envs)]
+
     def _on_step(self) -> bool:
-        # Required by BaseCallback; we don't need per-step logic here.
+        rewards = self.locals.get("rewards")
+        dones = self.locals.get("dones")
+        infos = self.locals.get("infos") or []
+        if rewards is None or dones is None or self._acc is None:
+            return True
+        # Accumulate normalized rewards per env
+        for i, r in enumerate(rewards):
+            self._acc[i] += float(r)
+        # On episode end, record return and length
+        for i, d in enumerate(dones):
+            if d:
+                self._recent_returns.append(self._acc[i])
+                # Prefer Monitor length if present
+                ep_len = 0
+                if i < len(infos) and isinstance(infos[i], dict):
+                    ep_len = int(infos[i].get('episode', {}).get('l', 0))
+                self._recent_lengths.append(ep_len)
+                self._acc[i] = 0.0
         return True
 
     def _on_rollout_end(self) -> None:
-        buf = list(self.model.ep_info_buffer)  # VecMonitor fills this
-        if buf:
-            mean_r = sum(e['r'] for e in buf) / len(buf)
-            mean_l = sum(e['l'] for e in buf) / len(buf)
-            print(f"[TRAIN] t={self.num_timesteps}  ep_rew_mean~{mean_r:.2f}  ep_len_mean~{mean_l:.1f}")
-            self.logger.record("train/ep_rew_mean_recent", mean_r)
+        if self._recent_returns:
+            mean_r = float(sum(self._recent_returns) / len(self._recent_returns))
+            mean_l = float(sum(self._recent_lengths) / len(self._recent_lengths)) if self._recent_lengths else 0.0
+            print(f"[TRAIN] t={self.num_timesteps}  ep_rew_mean(norm)~{mean_r:.2f}  ep_len_mean~{mean_l:.1f}")
+            self.logger.record("train/ep_rew_mean_recent_normalized", mean_r)
             self.logger.record("train/ep_len_mean_recent", mean_l)
 
 class WaypointTrainingCallback(BaseCallback):
@@ -236,29 +269,88 @@ class WaypointTrainingCallback(BaseCallback):
         return True
 
 class RewardTrackerCallback(BaseCallback):
-    """Track individual episode rewards for plotting."""
+    """Track individual episode rewards (NORMALIZED) for plotting."""
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
-        self.episode_rewards = []
+        self.episode_rewards = []   # normalized returns
         self.episode_lengths = []
         self.timesteps = []
+        self._acc = None  # per-env accumulators for normalized rewards
+
+    def _on_training_start(self) -> None:
+        n_envs = getattr(self.training_env, 'num_envs', 1)
+        self._acc = [0.0 for _ in range(n_envs)]
 
     def _on_step(self) -> bool:
+        rewards = self.locals.get("rewards")  # normalized rewards from VecNormalize
         dones = self.locals.get("dones")
         infos = self.locals.get("infos", [])
-        if dones is None:
+        if rewards is None or dones is None:
             return True
 
+        # Accumulate normalized rewards per env
+        if self._acc is None:
+            self._acc = [0.0 for _ in range(len(rewards))]
+        for i, r in enumerate(rewards):
+            self._acc[i] += float(r)
+
+        # On episode end, store normalized return and length
         for i, d in enumerate(dones):
             if d:
-                # Extract reward and length from the episode info
+                self.episode_rewards.append(self._acc[i])
+                ep_len = 0
                 if i < len(infos) and infos[i]:
-                    episode_reward = infos[i].get('episode', {}).get('r', 0)
-                    episode_length = infos[i].get('episode', {}).get('l', 0)
-                    self.episode_rewards.append(float(episode_reward))
-                    self.episode_lengths.append(int(episode_length))
-                    self.timesteps.append(self.num_timesteps)
+                    ep_len = int(infos[i].get('episode', {}).get('l', 0))
+                self.episode_lengths.append(ep_len)
+                self.timesteps.append(self.num_timesteps)
+                self._acc[i] = 0.0
         return True
+
+# --------------------------
+# Per-step reward logger (normalized)
+# --------------------------
+class StepRewardLogger(BaseCallback):
+    def __init__(self, sample_every: int = 10, smooth_window: int = 200, verbose: int = 0):
+        super().__init__(verbose)
+        self.sample_every = max(1, int(sample_every))
+        self.smooth_window = max(1, int(smooth_window))
+        self.timesteps = []       # num_timesteps at sample
+        self.step_rewards = []    # mean(normalized rewards across envs) at sample
+
+    def _on_step(self) -> bool:
+        rewards = self.locals.get("rewards")
+        if rewards is None:
+            return True
+        mean_r = float(np.mean(rewards))
+        # Log to tensorboard each step (normalized per-step)
+        self.logger.record("train/step_reward_norm_mean", mean_r)
+        if (self.num_timesteps % self.sample_every) == 0:
+            self.timesteps.append(self.num_timesteps)
+            self.step_rewards.append(mean_r)
+        return True
+
+def plot_step_rewards(timesteps, rewards, save_path, title="Per-step Reward (normalized)"):
+    plt.figure(figsize=(12, 6))
+    if len(rewards) > 0:
+        x = np.array(timesteps, dtype=np.int64)
+        y = np.array(rewards, dtype=np.float32)
+        plt.plot(x, y, color='tab:blue', alpha=0.4, linewidth=1, label='Per-step (sampled)')
+        # Smoothed curve for readability
+        if len(y) > 50:
+            w = max(25, len(y)//100)
+            ma = np.convolve(y, np.ones(w)/w, mode='valid')
+            xs = x[w-1:]
+            plt.plot(xs, ma, color='tab:red', linewidth=2, label=f'Moving Avg (w={w})')
+            plt.legend()
+    else:
+        plt.text(0.5, 0.5, 'No per-step samples recorded', ha='center', va='center', transform=plt.gca().transAxes)
+    plt.xlabel('Timesteps')
+    plt.ylabel('Reward (normalized)')
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    out = os.path.join(save_path, 'per_step_reward.png')
+    plt.tight_layout(); plt.savefig(out, dpi=150, bbox_inches='tight'); plt.close()
+    print(f"[PLOT] Per-step reward plot saved to {out}")
 
 # --------------------------
 # Plotting functions
@@ -475,7 +567,7 @@ def parse_args():
 
     # PPO
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--n-steps", type=int, default=409600)
+    p.add_argument("--n-steps", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--n-epochs", type=int, default=10)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -486,9 +578,9 @@ def parse_args():
     p.add_argument("--max-grad-norm", type=float, default=0.5)
 
     # Env
-    p.add_argument("--num-drones", type=int, default=5)
-    p.add_argument("--num-waypoints", type=int, default=200)
-    p.add_argument("--episode-len", type=int, default=3000)
+    p.add_argument("--num-drones", type=int, default=4)
+    p.add_argument("--num-waypoints", type=int, default=50)
+    p.add_argument("--episode-len", type=int, default=600)
     p.add_argument("--waypoint-radius", type=float, default=0.5)
     p.add_argument("--waypoint-hold-steps", type=int, default=5)
     p.add_argument("--priority-mode", type=str, default="distance",
@@ -505,7 +597,7 @@ def parse_args():
     p.add_argument("--log-dir", type=str, default="logs/")
     p.add_argument("--save-freq", type=int, default=50_000)
     p.add_argument("--eval-freq", type=int, default=10_000)
-    p.add_argument("--eval-episodes", type=int, default=5)
+    p.add_argument("--eval-episodes", type=int, default=1)
     p.add_argument("--target-reward", type=float, default=100.0, help="Target reward for early stopping")
     p.add_argument("--early-stop-on-reward", action="store_true", help="Stop when average eval reward >= target")
     p.add_argument("--eval-deterministic", action="store_true", help="Use deterministic policy for evaluation")
@@ -514,6 +606,9 @@ def parse_args():
     p.add_argument("--quick", action="store_true", help="Reduced settings for a fast test run")
     p.add_argument("--verbose", action="store_true", help="Enable verbose logging for debugging")
     # Always plotting; legacy flags removed
+
+    # Step-level logging
+    p.add_argument("--step-log-every", type=int, default=20, help="Sample and record per-step reward every N timesteps")
 
     return p.parse_args()
 
@@ -606,6 +701,10 @@ def main():
     reward_tracker = RewardTrackerCallback(verbose=0)
     callbacks.append(reward_tracker)
 
+    # Per-step reward logger (normalized, sampled)
+    step_cb = StepRewardLogger(sample_every=args.step_log_every, smooth_window=200)
+    callbacks.append(step_cb)
+
     # Rolling train printer + custom waypoint metrics
     callbacks.append(RolloutPrinter())
     waypoint_cb = WaypointTrainingCallback(verbose=1, log_freq=100)
@@ -674,6 +773,15 @@ def main():
     }
     np.savez(os.path.join(args.save_path, 'reward_data.npz'), **reward_data)
     print(f"[SAVE] Raw reward data saved to {os.path.join(args.save_path, 'reward_data.npz')}")
+
+    # Per-step reward plot + save
+    plot_step_rewards(step_cb.timesteps, step_cb.step_rewards, args.save_path)
+    step_data = {
+        'timesteps': np.array(step_cb.timesteps, dtype=np.int64),
+        'step_rewards_norm': np.array(step_cb.step_rewards, dtype=np.float32)
+    }
+    np.savez(os.path.join(args.save_path, 'step_rewards_norm.npz'), **step_data)
+    print(f"[SAVE] Per-step reward data saved to {os.path.join(args.save_path, 'step_rewards_norm.npz')}")
 
     # Waypoint metrics plots (always create a figure)
     plot_waypoint_metrics(

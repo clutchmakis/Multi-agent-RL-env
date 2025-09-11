@@ -78,8 +78,8 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Workspace bounds for waypoint generation
         if workspace_bounds is None:
             self.workspace_bounds = (
-                np.array([-5.0, -5.0, 0.5], dtype=np.float32),
-                np.array([5, 5, 2.5], dtype=np.float32)
+                np.array([-50.0, -50.0, 5], dtype=np.float32),
+                np.array([50, 50, 25], dtype=np.float32)
             )
         else:
             self.workspace_bounds = (
@@ -121,6 +121,8 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Fixing the idle movements of the drone 
         self._last_dist_to_target = np.full(self.num_drones, np.inf, dtype=np.float32)
         self._stagnant_steps = np.zeros(self.num_drones, dtype=np.int32)
+        # Light action smoothing to reduce per-step jitter (EMA per agent)
+        self._prev_actions = np.zeros((self.num_drones, 3), dtype=np.float32)
 
         # Initial positions
         if initial_xyzs is None:
@@ -386,6 +388,11 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             
             # Combine all features
             full_obs = np.concatenate([base_obs, waypoint_features, neighbor_features])
+            # Guard against non-finite values propagating into the policy
+            if not np.all(np.isfinite(full_obs)):
+                if getattr(self, 'verbose', False):
+                    self._log(f"[OBS][WARN] Non-finite obs for {agent_key}; sanitizing")
+                full_obs = np.nan_to_num(full_obs, nan=0.0, posinf=1e6, neginf=-1e6)
             obs_dict[agent_key] = full_obs.astype(np.float32)
         
         return obs_dict
@@ -467,13 +474,13 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             if 0 <= target_i < self.num_waypoints:
                 d = np.linalg.norm(self._getDroneStateVector(i)[0:3] - self.waypoint_pool[target_i])
             
-                if d > self._last_dist_to_target[i] - 1e-3:
+                if d > self._last_dist_to_target[i] - 1e-4:
                     self._stagnant_steps[i] += 1
                 else:
                     self._stagnant_steps[i] = 0
                 self._last_dist_to_target[i] = d
 
-                if self._stagnant_steps[i] > 60:  # ~2s @30Hz
+                if self._stagnant_steps[i] > 120:  # ~2s @30Hz
                     # Consider this an unsuccessful attempt to complete the waypoint
                     self.agent_waypoints_failed[f"agent_{i}"] += 1
                     if 0 <= target_i < self.num_waypoints:
@@ -554,7 +561,11 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Get current agent position and target waypoint
         agent_pos = self._getDroneStateVector(agent_id)[0:3]
         target_idx = self.agent_target_waypoint[agent_id]
-        action = np.clip(action, -1.0, 1.0)  # Ensure action is within valid range
+        action = np.clip(action, -1.0, 1.0)  # Clip action
+        # Light EMA smoothing to reduce target jitter at high ctrl_freq
+        alpha = 0.3
+        action = (1.0 - alpha) * self._prev_actions[agent_id] + alpha * action
+        self._prev_actions[agent_id] = action
 
         if 0 <= target_idx < self.num_waypoints:
             
@@ -569,18 +580,26 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
                 # 1. WAYPOINT COMPONENT: Move directly toward the waypoint
                 # Normalization 
                 direction = to_target / (dist + 1e-6)  # Unit vector toward waypoint
+                
 
                 # Scale step size based on control frequency for consistent behavior
                 # Higher frequency = smaller steps needed for same real-time movement
-                base = 0.5 * (self.ctrl_freq / 30.0)  # Base step size (scaled for ctrl_freq)
+                # it was self.ctrl_freq / 30.0
+                base = 0.5 * ( 30.0 / self.ctrl_freq )  # Base step size (scaled for ctrl_freq)
                 step_size = min(base, 0.6 * dist)  # Don't overshoot if waypoint is close
                 waypoint_component = direction * step_size  # Movement toward waypoint
 
                 # 2. AGENT COMPONENT: Allow RL policy to influence movement
                 # Scale RL influence based on distance - more control when far from waypoint
                 # This gives RL more freedom for exploration when not close to target
-                agent_scale = 0.15 if dist < 2.0 else 0.25  # Smaller scale when close
-                agent_component = action * agent_scale  # RL action contribution
+                agent_scale = 0.10 if dist < 2.0 else 0.60  # Smaller scale when close
+                # Allow only non-negative component along the target direction
+                a_par_mag = float(np.dot(action, direction))
+                a_par_mag = max(0.0, a_par_mag)
+                a_par = a_par_mag * direction
+                # Lateral component (orthogonal to direction)
+                a_perp = action - float(np.dot(action, direction)) * direction
+                agent_component = a_par * agent_scale + a_perp * (0.5 * agent_scale)
 
                 # 3. FINAL TARGET: Current position + waypoint movement + RL movement
                 blended = agent_pos + waypoint_component + agent_component
@@ -611,62 +630,80 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     
     def _computeAgentReward(self, agent_id: int):
         """Compute reward for a single agent."""
-
         reward = 0.0
         components = {} if self.verbose else None
 
         agent_state = self._getDroneStateVector(agent_id)
         agent_pos = agent_state[0:3]
         agent_vel = agent_state[10:13]
+        speed = float(np.linalg.norm(agent_vel))
 
         target_idx = self.agent_target_waypoint[agent_id]
 
-        # Reward for having a target
-        if target_idx >= 0:
-            reward += 0.5
+        # Baseline: discourage idling strongly
+        if speed < 0.05:
+            reward -= 0.3
             if components is not None:
-                components['has_target'] = 0.5
+                components['idle_penalty'] = -0.3
 
-            # Distance reward
+        if target_idx >= 0:
+            # Has target small positive
+            reward += 0.3
+            if components is not None:
+                components['has_target'] = 0.3
+
             target_pos = self.waypoint_pool[target_idx]
             distance = np.linalg.norm(agent_pos - target_pos)
-            max_distance = 10.0 
-            distance_reward = max(0.0, 1.0 - distance / max_distance)
-            reward += distance_reward * 1.0
-            if components is not None:
-                components['distance'] = distance_reward * 1.0
 
-            # Progress shaping
+            # Distance shaping (bounded)
+            max_distance = 10.0
+            distance_reward = max(0.0, 1.0 - distance / max_distance)
+            reward += 0.8 * distance_reward
+            if components is not None:
+                components['distance'] = 0.8 * float(distance_reward)
+
+            # Progress shaping (encourage decreasing distance)
             prev = self._prev_dist[agent_id]
             if not np.isfinite(prev):
                 self._prev_dist[agent_id] = distance
             else:
                 progress = prev - distance
-                progress_reward = 0.5 * np.clip(progress, -0.5, 0.5)
+                progress_reward = 0.4 * float(np.clip(progress, -0.5, 0.5))
                 reward += progress_reward
                 if components is not None:
                     components['progress'] = float(progress_reward)
                 self._prev_dist[agent_id] = distance
 
-            # Velocity toward target
-            if distance > 0.1:
-                direction = (target_pos - agent_pos) / distance
-                vel_toward = np.dot(agent_vel, direction)
-                vel_reward = vel_toward * 0.2
+            # Movement toward target vs away from it
+            if distance > 1e-3:
+                direction = (target_pos - agent_pos) / (distance + 1e-9)
+                vel_toward = float(np.dot(agent_vel, direction))
+                # Linear shaping around 0; negative when moving away
+                vel_reward = 0.2 * vel_toward
                 reward += vel_reward
+                if vel_toward <= 0.0:
+                    # Extra penalty when not moving toward the waypoint
+                    reward -= 0.2
+                    if components is not None:
+                        components['not_toward'] = -0.2
                 if components is not None:
                     components['velocity'] = float(vel_reward)
 
-            # In-radius bonus
+            # In-radius vs out-of-radius
             if distance < self.waypoint_radius:
-                reward += 2.0
+                reward += 2.5
                 if components is not None:
-                    components['in_radius'] = 2.0
+                    components['in_radius'] = 2.5
+            else:
+                reward -= 0.1
+                if components is not None:
+                    components['not_in_radius'] = -0.1
 
         else:
-            reward -= 0.1
+            # No target assigned penalized
+            reward -= 0.2
             if components is not None:
-                components['no_target'] = -0.1
+                components['no_target'] = -0.2
 
         # Stability penalties
         roll, pitch = agent_state[7:9]
@@ -685,18 +722,24 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             if components is not None:
                 components['altitude_high'] = -0.1
 
-        # Collision avoidance
+        # Coordination: keep reasonable separation (bonus in [1.5, 4.0])
         for j in range(self.num_drones):
-            if j != agent_id:
-                other_pos = self._getDroneStateVector(j)[0:3]
-                dist = np.linalg.norm(agent_pos - other_pos)
-                if dist < 1.0:
-                    penalty = -1.0 * max(0, 1.0 - dist)
-                    reward += penalty
-                    if components is not None:
-                        components[f'collision_{j}'] = float(penalty)
+            if j == agent_id:
+                continue
+            other_pos = self._getDroneStateVector(j)[0:3]
+            dist = float(np.linalg.norm(agent_pos - other_pos))
+            if dist < 1.0:
+                penalty = -1.0 * max(0.0, 1.0 - dist)
+                reward += penalty
+                if components is not None:
+                    components[f'collision_{j}'] = float(penalty)
+            elif 1.5 <= dist <= 4.0:
+                bonus = 0.02 * (dist - 1.5) / (4.0 - 1.5)
+                reward += bonus
+                if components is not None:
+                    components[f'separation_{j}'] = float(bonus)
 
-        # Completion bonus with diminishing returns
+        # Completion bonus with stronger value and diminishing returns
         if not hasattr(self, '_last_completed_count'):
             self._last_completed_count = {f'agent_{i}': 0 for i in range(self.num_drones)}
         key = f'agent_{agent_id}'
@@ -705,7 +748,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         current_count = self.agent_waypoints_completed[key]
         if current_count > self._last_completed_count[key]:
             bonus_multiplier = max(0.3, 1.0 - (current_count - 1) * 0.2)
-            completion_bonus = 10.0 * bonus_multiplier
+            completion_bonus = 20.0 * bonus_multiplier
             reward += completion_bonus
             if components is not None:
                 components['completion'] = float(completion_bonus)
@@ -714,7 +757,7 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         if self.verbose and reward < -1.0:
             self._log(f"[REWARD] Agent {agent_id}: {reward:.2f} - Components: {components}")
 
-        return float(np.clip(reward, -2.0, 8.0))
+        return float(np.clip(reward, -3.0, 12.0))
 
     # (Removed) _computeDetailedReward: merged into _computeAgentReward when verbose
     
@@ -730,14 +773,14 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             rpy = state[7:10]
             
             # Crash or out of bounds
-            if (pos[2] < 0.05 or 
-                abs(rpy[0]) > np.pi/2 or 
-                abs(rpy[1]) > np.pi/2 or
-                np.any(pos < self.workspace_bounds[0] - 5) or
-                np.any(pos > self.workspace_bounds[1] + 5)):
-                terminated[agent_key] = True
-            else:
-                terminated[agent_key] = False
+            #if (pos[2] < 0.05 or 
+            #    abs(rpy[0]) > np.pi/2 or 
+            #    abs(rpy[1]) > np.pi/2 or
+            #    np.any(pos < self.workspace_bounds[0] - 5) or
+            #    np.any(pos > self.workspace_bounds[1] + 5)):
+            #    terminated[agent_key] = True
+            #else:
+            #    terminated[agent_key] = False
 
         # Early termination: pool exhausted and no active targets
         if self._early_term_reason is None and self.terminate_when_pool_exhausted:
@@ -814,6 +857,9 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         
         # Reset progress tracker
         self._prev_dist[:] = np.inf
+        # Reset action smoothing state
+        if hasattr(self, '_prev_actions'):
+            self._prev_actions[:] = 0.0
 
 
         # Regenerate waypoint pool if requested
