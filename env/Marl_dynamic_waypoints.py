@@ -78,8 +78,8 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         # Workspace bounds for waypoint generation
         if workspace_bounds is None:
             self.workspace_bounds = (
-                np.array([-50.0, -50.0, 5], dtype=np.float32),
-                np.array([50, 50, 25], dtype=np.float32)
+                np.array([-5.0, -5.0, 0.5], dtype=np.float32),
+                np.array([5, 5, 5], dtype=np.float32)
             )
         else:
             self.workspace_bounds = (
@@ -574,40 +574,36 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
             to_target = wp - agent_pos  # Vector from agent to waypoint
             dist = np.linalg.norm(to_target)  # Distance to waypoint
 
-            if dist > 1 * self.waypoint_radius:
-                # Far from waypoint: blend waypoint direction with RL action
+        
+            # Far from waypoint: blend waypoint direction with RL action
 
-                # 1. WAYPOINT COMPONENT: Move directly toward the waypoint
-                # Normalization 
-                direction = to_target / (dist + 1e-6)  # Unit vector toward waypoint
-                
+            # 1. WAYPOINT COMPONENT: Move directly toward the waypoint
+            # Normalization 
+            direction = to_target / (dist + 1e-6)  # Unit vector toward waypoint
+            
 
-                # Scale step size based on control frequency for consistent behavior
-                # Higher frequency = smaller steps needed for same real-time movement
-                # it was self.ctrl_freq / 30.0
-                base = 0.5 * ( 30.0 / self.ctrl_freq )  # Base step size (scaled for ctrl_freq)
-                step_size = min(base, 0.6 * dist)  # Don't overshoot if waypoint is close
-                waypoint_component = direction * step_size  # Movement toward waypoint
+            # Scale step size based on control frequency for consistent behavior
+            # Higher frequency = smaller steps needed for same real-time movement
+            # it was self.ctrl_freq / 30.0
+            base = 0.5 * ( 30.0 / self.ctrl_freq )  # Base step size (scaled for ctrl_freq)
+            step_size = min(base, 0.6 * dist)  # Don't overshoot if waypoint is close
+            waypoint_component = direction * step_size  # Movement toward waypoint
 
-                # 2. AGENT COMPONENT: Allow RL policy to influence movement
-                # Scale RL influence based on distance - more control when far from waypoint
-                # This gives RL more freedom for exploration when not close to target
-                agent_scale = 0.10 if dist < 2.0 else 0.60  # Smaller scale when close
-                # Allow only non-negative component along the target direction
-                a_par_mag = float(np.dot(action, direction))
-                a_par_mag = max(0.0, a_par_mag)
-                a_par = a_par_mag * direction
-                # Lateral component (orthogonal to direction)
-                a_perp = action - float(np.dot(action, direction)) * direction
-                agent_component = a_par * agent_scale + a_perp * (0.5 * agent_scale)
+            # 2. AGENT COMPONENT: Allow RL policy to influence movement
+            # Scale RL influence based on distance - more control when far from waypoint
+            # This gives RL more freedom for exploration when not close to target
+            agent_scale = 0.10 if dist < 2.0 else 1  # Smaller scale when close
+            # Allow only non-negative component along the target direction
+            a_par_mag = float(np.dot(action, direction))
+            a_par_mag = max(0.0, a_par_mag)
+            a_par = a_par_mag * direction
+            # Lateral component (orthogonal to direction)
+            a_perp = action - float(np.dot(action, direction)) * direction
+            agent_component = a_par * agent_scale + a_perp * agent_scale
 
-                # 3. FINAL TARGET: Current position + waypoint movement + RL movement
-                blended = agent_pos + waypoint_component + agent_component
+            # 3. FINAL TARGET: Current position + waypoint movement + RL movement
+            blended = agent_pos + waypoint_component + agent_component
 
-            else:
-                # Close to waypoint: Pin exactly to waypoint for stable holding
-                # This ensures the drone reaches and stays at the exact waypoint position
-                blended = wp
         else:
             # No assigned waypoint: Allow free movement with some damping
             # RL has full control but movement is scaled down for safety

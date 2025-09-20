@@ -311,6 +311,11 @@ class RewardTrackerCallback(BaseCallback):
 # --------------------------
 class StepRewardLogger(BaseCallback):
     def __init__(self, sample_every: int = 10, smooth_window: int = 200, verbose: int = 0):
+        """Record per-step normalized rewards.
+
+        sample_every: record every N env steps (1 = every step)
+        smooth_window: window used by plotting for moving average
+        """
         super().__init__(verbose)
         self.sample_every = max(1, int(sample_every))
         self.smooth_window = max(1, int(smooth_window))
@@ -329,7 +334,7 @@ class StepRewardLogger(BaseCallback):
             self.step_rewards.append(mean_r)
         return True
 
-def plot_step_rewards(timesteps, rewards, save_path, title="Per-step Reward (normalized)"):
+def plot_step_rewards(timesteps, rewards, save_path, title="Per-step Reward (normalized)", smooth_window: int | None = None):
     plt.figure(figsize=(12, 6))
     if len(rewards) > 0:
         x = np.array(timesteps, dtype=np.int64)
@@ -337,7 +342,10 @@ def plot_step_rewards(timesteps, rewards, save_path, title="Per-step Reward (nor
         plt.plot(x, y, color='tab:blue', alpha=0.4, linewidth=1, label='Per-step (sampled)')
         # Smoothed curve for readability
         if len(y) > 50:
-            w = max(25, len(y)//100)
+            if smooth_window is None:
+                w = max(25, len(y)//10)
+            else:
+                w = max(1, int(smooth_window))
             ma = np.convolve(y, np.ones(w)/w, mode='valid')
             xs = x[w-1:]
             plt.plot(xs, ma, color='tab:red', linewidth=2, label=f'Moving Avg (w={w})')
@@ -561,19 +569,19 @@ def parse_args():
 
     # Training
     p.add_argument("--timesteps", type=int, default=500_000)
-    p.add_argument("--n-envs", type=int, default=1)
+    p.add_argument("--n-envs", type=int, default=16)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
 
     # PPO
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--n-steps", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--n-epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--n-epochs", type=int, default=5)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
-    p.add_argument("--clip-range", type=float, default=0.2)
-    p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--clip-range", type=float, default=0.1)
+    p.add_argument("--ent-coef", type=float, default=0)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
 
@@ -596,7 +604,7 @@ def parse_args():
     p.add_argument("--save-path", type=str, default="models/dynamic_waypoints_ppo")
     p.add_argument("--log-dir", type=str, default="logs/")
     p.add_argument("--save-freq", type=int, default=50_000)
-    p.add_argument("--eval-freq", type=int, default=10_000)
+    p.add_argument("--eval-freq", type=int, default=1_000)
     p.add_argument("--eval-episodes", type=int, default=1)
     p.add_argument("--target-reward", type=float, default=100.0, help="Target reward for early stopping")
     p.add_argument("--early-stop-on-reward", action="store_true", help="Stop when average eval reward >= target")
@@ -608,7 +616,10 @@ def parse_args():
     # Always plotting; legacy flags removed
 
     # Step-level logging
-    p.add_argument("--step-log-every", type=int, default=20, help="Sample and record per-step reward every N timesteps")
+    p.add_argument("--step-log-every", type=int, default=1,
+                   help="Record per-step reward every N timesteps (1 = every step)")
+    p.add_argument("--step-smooth-window", type=int, default=1000,
+                   help="Window for moving average in per-step plot")
 
     return p.parse_args()
 
@@ -702,7 +713,7 @@ def main():
     callbacks.append(reward_tracker)
 
     # Per-step reward logger (normalized, sampled)
-    step_cb = StepRewardLogger(sample_every=args.step_log_every, smooth_window=200)
+    step_cb = StepRewardLogger(sample_every=args.step_log_every, smooth_window=args.step_smooth_window)
     callbacks.append(step_cb)
 
     # Rolling train printer + custom waypoint metrics
@@ -775,7 +786,8 @@ def main():
     print(f"[SAVE] Raw reward data saved to {os.path.join(args.save_path, 'reward_data.npz')}")
 
     # Per-step reward plot + save
-    plot_step_rewards(step_cb.timesteps, step_cb.step_rewards, args.save_path)
+    plot_step_rewards(step_cb.timesteps, step_cb.step_rewards, args.save_path,
+                      smooth_window=args.step_smooth_window)
     step_data = {
         'timesteps': np.array(step_cb.timesteps, dtype=np.int64),
         'step_rewards_norm': np.array(step_cb.step_rewards, dtype=np.float32)
