@@ -4,6 +4,7 @@ Multi-Agent RL Environment: Dynamic Waypoints
 A lightweight research sandbox for multi‑agent navigation with dynamic waypoint allocation, built on top of Gymnasium + PyBullet + Stable‑Baselines3. It includes:
 
 - A custom multi‑agent env with a shared waypoint pool and assignment/coordination logic.
+- Per‑drone neural network control: each drone's neural net outputs a 3D direction; PID controllers handle the actual movement.
 - Centralized PPO training (flattened multi‑agent observations/actions) with TensorBoard logging.
 - Rich metrics and plots (rewards, waypoint coverage/success, per‑agent stats) saved automatically.
 - A GUI visualizer for trained models with slow‑motion and on‑screen debug overlay.
@@ -13,16 +14,23 @@ Repo Layout
 -----------
 - `env/Marl_dynamic_waypoints.py`: Main environment (dynamic waypoint pool, assignment, rewards, early termination).
 - `env/BaseRLAviary.py`, `env/BaseAviary.py`: Minimal aviary scaffolding used by the env.
-- `examples/Marl_dyn_train.py.py`: Centralized PPO training script + plotting + best‑model eval callback.
+- `examples/Marl_dyn_train.py`: Centralized PPO training script + plotting + best‑model eval callback.
 - `examples/Marl_dyn_vis.py`: GUI visualizer for trained models (or random/heuristic with minor changes).
 - `utils/*`: Assorted helpers and enums.
+- `TODO.md`: Planned future work and change log.
+
+
+Architecture
+------------
+- **Neural net → direction, PID → movement**: Each drone has its own copy of the neural network (shared weights via centralized PPO). The neural net receives per‑drone observations (kinematics + waypoint features + neighbor features) and outputs a 3D direction vector. The PID controller then converts the direction into motor RPMs to move the drone.
+- Waypoint information (relative position, distance, etc.) is part of each drone's observation, so the neural net learns to navigate toward assigned waypoints without any hardcoded autopilot logic.
 
 
 Key Features
 ------------
 - Dynamic waypoint pool with minimum separation and optional reuse of completed waypoints.
 - Multiple assignment modes: `sequential`, `distance`, `random`. If SciPy is available, a Hungarian/global assignment pass is used for initial allocations.
-- Blended control: learned 3D action is blended with the waypoint direction and sent to the PID controller.
+- Neural net direction control: learned 3D action is used as the direction and sent to the PID controller (autopilot blending is disabled).
 - Rich info dict: per‑agent completions/assignments/failures; per‑waypoint assigned/completed/failed counts for the current episode.
 - Early termination (pool exhaustion only): episode ends after ALL waypoints are completed and no agent has an active target; a short grace window keeps the sim running a few extra steps for visibility.
 
@@ -38,9 +46,9 @@ Requirements
 Quick Start (Training)
 ----------------------
 - Train a small model and auto‑generate plots and logs:
-  - `python3 examples/Marl_dyn_train.py.py --quick`
+  - `python3 examples/Marl_dyn_train.py --quick`
 - Typical training run (single env):
-  - `python3 examples/Marl_dyn_train.py.py --timesteps 500000 --num-drones 4 --num-waypoints 20`
+  - `python3 examples/Marl_dyn_train.py --timesteps 500000 --num-drones 4 --num-waypoints 20`
 - Multi‑process vector envs:
   - `--n-envs 4` (ensure your machine can handle the extra processes)
 
@@ -70,7 +78,7 @@ Environment Details
 -------------------
 - Observation/Action:
   - Multi‑agent dict observation is flattened for centralized PPO via a thin wrapper.
-  - Action is a 3‑vector per agent; env blends policy action with waypoint direction and feeds a PID controller.
+  - Action is a 3‑vector per agent (direction); the PID controller converts it into motor commands. The neural net is fully responsible for choosing direction.
 - Waypoints:
   - Generated in a bounded workspace with minimum separation.
   - Completed waypoints are retired (no reuse).

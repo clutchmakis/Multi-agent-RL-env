@@ -8,7 +8,7 @@ This document explains the architecture, environment dynamics, training and visu
 -----------------------
 - Multi‑agent drones must visit a shared pool of 3D waypoints.
 - Waypoints are generated inside a bounded workspace with a minimum separation.
-- Each agent receives a 3‑vector action; the env blends this with the vector to its assigned waypoint, then feeds the resulting position target to a PID controller (from the aviary base).
+- Each agent receives a 3‑vector action from its neural network; this direction is converted into a PID target position (the previous autopilot blending is commented out). The PID controller then generates motor RPMs.
 - Waypoint lifecycle:
   - CLAIMED while an agent is attempting it
   - COMPLETED on success (permanently retired)
@@ -20,9 +20,10 @@ This document explains the architecture, environment dynamics, training and visu
 ---------------
 - env/Marl_dynamic_waypoints.py: Core environment class and logic
 - env/BaseRLAviary.py, env/BaseAviary.py: Lightweight aviary scaffolding + PID control interface
-- examples/Marl_dyn_train.py.py: Centralized PPO training script, callbacks, plotting
+- examples/Marl_dyn_train.py: Centralized PPO training script, callbacks, plotting
 - examples/Marl_dyn_vis.py: GUI visualizer for trained models, overlays, plots
 - utils/*: Misc helpers and enums
+- TODO.md: Planned future work and change log
 
 
 3) Environment Design (env/Marl_dynamic_waypoints.py)
@@ -64,16 +65,19 @@ Waypoint lifecycle
   - failure (stagnation) → AVAILABLE (retry)
 - Waypoint/agent metrics are incremented on claim, success, and failure
 
-Control blending
-- Function: `_computeBlendedTarget()` (env/Marl_dynamic_waypoints.py:542)
-- Blends two vectors:
-  - waypoint_component: unit vector to target × step size (scaled by distance and `ctrl_freq`)
-  - agent_component: scaled policy action (less near the target)
-- Final target is clipped to workspace bounds and sent to the PID controller in BaseRLAviary
+Control: neural net direction → PID movement
+- Function: `_computeBlendedTarget()` (env/Marl_dynamic_waypoints.py)
+- The neural network outputs a 3D direction vector per drone.
+- This direction is scaled and added to the drone's current position to form a PID target.
+- The PID controller (in BaseRLAviary) then generates motor RPMs to move the drone.
+- The previous autopilot blending (hardcoded waypoint‑following component) has been
+  commented out; the neural net is now fully responsible for choosing direction.
+- Waypoint information is available in the observation space so the network can
+  learn to navigate toward assigned waypoints.
 
 Step loop
 - Function: `step(action_dict)` (env/Marl_dynamic_waypoints.py:455)
-  - Convert centralized dict action into per‑agent targets with `_computeBlendedTarget`
+  - Convert centralized dict action into per‑agent PID targets with `_computeBlendedTarget` (neural net direction → target position)
   - Call super().step to advance physics
   - Stagnation detection: if distance to target doesn’t shrink for several steps → failure path, waypoint returns to AVAILABLE and reassigns
   - Success detection: `_checkWaypointReached` → COMPLETED, assign new waypoint if any
@@ -89,11 +93,10 @@ Rewards
   - In‑radius small bonus (promotes stable holding)
   - Stability and altitude penalties
   - Completion bonus (with diminishing returns)
-- For verbose debugging: `_computeDetailedReward()` prints component breakdowns
+- For verbose debugging: `_computeAgentReward()` with `verbose=True` prints component breakdowns
 
 Termination and truncation
-- `_computeTerminatedDict()` (env/Marl_dynamic_waypoints.py:795):
-  - Per‑agent crash/out‑of‑bounds
+- `_computeTerminatedDict()` (env/Marl_dynamic_waypoints.py):
   - Global early termination when all waypoints COMPLETED and no agent has a target
   - Grace window: must hold the above for `early_termination_grace_steps` before ending the episode
 - `_computeTruncatedDict()` (env/Marl_dynamic_waypoints.py:833): time limit
@@ -109,10 +112,12 @@ Reset and visualization
 - `_addObstacles()` (env/Marl_dynamic_waypoints.py:912) places visual spheres for waypoints (when GUI on)
 
 
-4) Training Pipeline (examples/Marl_dyn_train.py.py)
+4) Training Pipeline (examples/Marl_dyn_train.py)
 ----------------------------------------------------
 Centralized PPO
-- FlattenDictWrapper flattens the multi‑agent dict into a single Box observation and concatenates per‑agent actions
+- FlattenDictWrapper flattens the multi‑agent dict into a single Box observation and concatenates per‑agent actions.
+  Each drone effectively has its own "slice" of the policy network (shared weights).
+  The neural net outputs a direction per drone; PID controllers handle movement.
 - VecMonitor -> VecNormalize: vector‑level episode stats + obs/reward normalization
 - PPO policy configured with an MLP and standard hyperparameters
 
@@ -172,7 +177,7 @@ Saved NPZ structures
 
 7) CLI Reference (Common Flags)
 -------------------------------
-Training (examples/Marl_dyn_train.py.py)
+Training (examples/Marl_dyn_train.py)
 - `--timesteps`, `--n-envs`, `--seed`, `--device`
 - PPO: `--lr`, `--n-steps`, `--batch-size`, `--n-epochs`, `--gamma`, `--gae-lambda`, `--clip-range`, `--ent-coef`, `--vf-coef`, `--max-grad-norm`
 - Env: `--num-drones`, `--num-waypoints`, `--episode-len`, `--waypoint-radius`, `--waypoint-hold-steps`, `--priority-mode`, `--min-waypoint-separation`, `--pyb-freq`, `--ctrl-freq`
@@ -223,31 +228,30 @@ PyBullet warnings
 
 10) Function‑Level Reference (Environment)
 -----------------------------------------
-- `__init__` (env/Marl_dynamic_waypoints.py:28): Configure workspace, waypoints, spaces, early termination, and visuals.
-- `_log` (env/Marl_dynamic_waypoints.py:164): Conditional print when `verbose` is true.
-- `_generateWaypointPool` (env/Marl_dynamic_waypoints.py:169): Build waypoint pool with min separation.
-- `_globalAssign` (env/Marl_dynamic_waypoints.py:203): Hungarian assignment for free agents to available waypoints.
-- `_assignInitialWaypoints` (env/Marl_dynamic_waypoints.py:224): Seed initial assignments at reset.
-- `_selectWaypointForAgent` (env/Marl_dynamic_waypoints.py:243): Local selection per priority mode.
-- `_claimWaypoint` (env/Marl_dynamic_waypoints.py:267): Claim bookkeeping and metrics.
-- `_releaseWaypoint` (env/Marl_dynamic_waypoints.py:282): Release to AVAILABLE (failure) or mark COMPLETED (success).
-- `_checkWaypointReached` (env/Marl_dynamic_waypoints.py:309): Hold‑time success check.
-- `_setupMultiAgentSpaces` (env/Marl_dynamic_waypoints.py:350): Build action/observation dict spaces.
-- `_computeObs` (env/Marl_dynamic_waypoints.py:380): Per‑agent observation assembly.
-- `_getWaypointFeatures` (env/Marl_dynamic_waypoints.py:404): Per‑agent waypoint feature vector.
-- `_getNeighborFeatures` (env/Marl_dynamic_waypoints.py:434): Neighbor relative position/velocity features.
-- `step` (env/Marl_dynamic_waypoints.py:455): Main loop; blending, stagnation + success checks, reassignment, reward/obs/termination/info.
-- `_computeBlendedTarget` (env/Marl_dynamic_waypoints.py:542): Blend action with waypoint vector into a position target.
-- `_computeRewardDict` (env/Marl_dynamic_waypoints.py:607): Per‑agent rewards.
-- `_computeAgentReward` (env/Marl_dynamic_waypoints.py:617): Reward components & shaping.
-- `_computeDetailedReward` (env/Marl_dynamic_waypoints.py:703): Reward with component breakdown (debug).
-- `_computeTerminatedDict` (env/Marl_dynamic_waypoints.py:795): Crash and early termination logic.
-- `_computeTruncatedDict` (env/Marl_dynamic_waypoints.py:833): Time limit.
-- `_computeInfoDict` (env/Marl_dynamic_waypoints.py:838): Per‑agent and per‑episode info.
-- `reset` (env/Marl_dynamic_waypoints.py:871): Clear episode state and assign initial waypoints.
-- `_addObstacles` (env/Marl_dynamic_waypoints.py:912): Render waypoint visuals in GUI mode.
-- `_computeReward` (env/Marl_dynamic_waypoints.py:943): Required by base; sum of per‑agent rewards.
-- `_computeTerminated` (env/Marl_dynamic_waypoints.py:948): Any agent terminated.
-- `_computeTruncated` (env/Marl_dynamic_waypoints.py:953): Any agent truncated.
-- `_computeInfo` (env/Marl_dynamic_waypoints.py:958): Combined info.
+- `__init__`: Configure workspace, waypoints, spaces, early termination, and visuals.
+- `_log`: Conditional print when `verbose` is true.
+- `_generateWaypointPool`: Build waypoint pool with min separation.
+- `_globalAssign`: Hungarian assignment for free agents to available waypoints.
+- `_assignInitialWaypoints`: Seed initial assignments at reset.
+- `_selectWaypointForAgent`: Local selection per priority mode.
+- `_claimWaypoint`: Claim bookkeeping and metrics.
+- `_releaseWaypoint`: Release to AVAILABLE (failure) or mark COMPLETED (success).
+- `_checkWaypointReached`: Hold‑time success check.
+- `_setupMultiAgentSpaces`: Build action/observation dict spaces.
+- `_computeObs`: Per‑agent observation assembly.
+- `_getWaypointFeatures`: Per‑agent waypoint feature vector.
+- `_getNeighborFeatures`: Neighbor relative position/velocity features.
+- `step`: Main loop; direction→PID target, stagnation + success checks, reassignment, reward/obs/termination/info.
+- `_computeBlendedTarget`: Convert neural net direction into a PID target position (autopilot blending commented out).
+- `_computeRewardDict`: Per‑agent rewards.
+- `_computeAgentReward`: Reward components & shaping.
+- `_computeTerminatedDict`: Early termination logic.
+- `_computeTruncatedDict`: Time limit.
+- `_computeInfoDict`: Per‑agent and per‑episode info.
+- `reset`: Clear episode state and assign initial waypoints.
+- `_addObstacles`: Render waypoint visuals in GUI mode.
+- `_computeReward`: Required by base; sum of per‑agent rewards.
+- `_computeTerminated`: Any agent terminated.
+- `_computeTruncated`: Any agent truncated.
+- `_computeInfo`: Combined info.
 
