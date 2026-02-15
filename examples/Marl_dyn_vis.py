@@ -1,10 +1,12 @@
 """
 Visualization script for dynamic waypoint environment.
 
+Architecture:
+- Each drone's neural network outputs a 3D direction; PID controllers handle movement.
 - Works with trained PPO models (using the SAME VecNormalize stats saved during training)
 - Or with heuristic / random policies
 - GUI enabled, static waypoint colors (no per-step recoloring)
-- Sanity-checks model vs env observation size to avoid (1, 328) vs (1, 508) errors
+- Sanity-checks model vs env observation size to avoid dimension mismatch errors
 """
 
 from __future__ import annotations

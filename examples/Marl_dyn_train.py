@@ -1,16 +1,20 @@
 """
 Training script for dynamic waypoint multi-agent environment (centralized PPO).
 
-- Train with VecMonitor + VecNormalize (train & eval wrapped identically)
-- Print live metrics to stdout and TensorBoard
-- Evaluate periodically DURING training (no separate retrain)
+Architecture:
+- Each drone has its own neural network (shared weights via centralized PPO)
+  that outputs a 3D direction vector.
+- The PID controllers handle the actual movement toward the neural-net-provided
+  direction targets.
+- Waypoint information is in the observations so the neural net can learn
+  to navigate toward assigned waypoints.
 
 Usage (typical):
-  python Marl_dyn_train.py.py --timesteps 500000 --num-drones 4 --num-waypoints 20 \
+  python Marl_dyn_train.py --timesteps 500000 --num-drones 4 --num-waypoints 20 \
     --waypoint-radius 0.5 --waypoint-hold-steps 5 --ctrl-freq 60
 
 Quick test:
-  python Marl_dyn_train.py.py --quick
+  python Marl_dyn_train.py --quick
 """
 
 from __future__ import annotations

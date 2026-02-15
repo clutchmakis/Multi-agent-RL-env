@@ -21,11 +21,24 @@ class WaypointStatus(Enum):
 class MultiAgentReinforcementLearning(BaseRLAviary):
     """Multi-agent environment with dynamic waypoint allocation.
     
+    Architecture:
+    - Each drone is controlled by a neural network that outputs a 3D direction
+      vector. The same network weights are shared across all drones (parameter
+      sharing), but each drone receives its own observation and produces its
+      own action independently.
+    - The neural network output (direction) is converted into a PID target
+      position by ``_computeBlendedTarget``, then the PID controller in
+      BaseRLAviary handles the low-level motor commands.
+    - Waypoint information (relative position, distance, etc.) is included in
+      the observation space so the neural network can learn to navigate toward
+      assigned waypoints.
+    
     Key Features:
     - Shared pool of waypoints that all drones can target
     - Priority-based waypoint claiming system
     - Dynamic waypoint selection after completion
     - Coordination to avoid waypoint conflicts
+    - Neural net → direction, PID → movement (no autopilot blending)
     """
     
     ENV_VERSION = "0.2.0"
@@ -451,9 +464,10 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
     def step(self, action_dict):
         """Advance simulation with waypoint management.
 
-        For PID control, the parent class expects per-agent target positions (length 3).
-        Here we blend the learned directional action with the waypoint direction
-        to form a next target position for each agent, then pass that to `super().step()`.
+        Each drone's neural network outputs a 3D direction vector. This method
+        converts those directions into PID target positions (via
+        ``_computeBlendedTarget``) and passes them to the parent physics step.
+        The PID controllers then handle the actual movement.
         """
         
         full_action = np.zeros((self.num_drones, 3), dtype=np.float32)
@@ -540,79 +554,71 @@ class MultiAgentReinforcementLearning(BaseRLAviary):
         return obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict
     
     def _computeBlendedTarget(self, agent_id: int, action: np.ndarray) -> np.ndarray:
-        """Blend waypoint direction with agent's raw action into a target position.
+        """Convert the neural network's direction action into a PID target position.
 
-        This function is the heart of the waypoint-following + RL hybrid approach.
-        It takes the agent's raw action (a 3D vector from -1 to 1) and blends it with
-        the direction toward the assigned waypoint to create a final target position.
+        The neural network outputs a 3D direction vector (each component in [-1, 1]).
+        This function converts that direction into a target position for the PID
+        controller by stepping from the drone's current position along the
+        neural-net-provided direction.
 
-        The blending creates a balance between:
-        - Following waypoints reliably (waypoint_component)
-        - Allowing RL exploration and adaptation (agent_component)
+        The PID controller (in BaseRLAviary) then handles the low-level motor
+        commands to actually move the drone toward the target position.
+
+        Architecture:
+            Neural net  →  direction (this function)  →  PID target position
+            PID controller  →  motor RPMs  →  physics
 
         Args:
             agent_id: Index of the agent (0 to num_drones-1)
-            action: Raw action vector from RL policy, shape (3,), clipped to [-1, 1]
+            action: Direction vector from RL policy, shape (3,), clipped to [-1, 1]
 
         Returns:
             Target position (x, y, z) for the drone's PID controller
         """
         
-        # Get current agent position and target waypoint
+        # Get current agent position
         agent_pos = self._getDroneStateVector(agent_id)[0:3]
-        target_idx = self.agent_target_waypoint[agent_id]
-        action = np.clip(action, -1.0, 1.0)  # Clip action
+        action = np.clip(action, -1.0, 1.0)
+
         # Light EMA smoothing to reduce target jitter at high ctrl_freq
         alpha = 0.3
         action = (1.0 - alpha) * self._prev_actions[agent_id] + alpha * action
         self._prev_actions[agent_id] = action
 
-        if 0 <= target_idx < self.num_waypoints:
-            
-            # Agent has an assigned waypoint - blend waypoint following with RL action
-            wp = self.waypoint_pool[target_idx]
-            to_target = wp - agent_pos  # Vector from agent to waypoint
-            dist = np.linalg.norm(to_target)  # Distance to waypoint
+        # --- AUTOPILOT BLENDING (commented out) ---
+        # Previously, the waypoint direction was blended with the RL action
+        # so the drone would partially follow waypoints automatically.
+        # Now the neural network is fully responsible for choosing direction;
+        # waypoint information is available in the observation space so the
+        # network can learn to navigate toward waypoints on its own.
+        #
+        # target_idx = self.agent_target_waypoint[agent_id]
+        # if 0 <= target_idx < self.num_waypoints:
+        #     wp = self.waypoint_pool[target_idx]
+        #     to_target = wp - agent_pos
+        #     dist = np.linalg.norm(to_target)
+        #     direction = to_target / (dist + 1e-6)
+        #     base = 0.5 * (30.0 / self.ctrl_freq)
+        #     step_size = min(base, 0.6 * dist)
+        #     waypoint_component = direction * step_size
+        #     agent_scale = 0.10 if dist < 2.0 else 1
+        #     a_par_mag = max(0.0, float(np.dot(action, direction)))
+        #     a_par = a_par_mag * direction
+        #     a_perp = action - float(np.dot(action, direction)) * direction
+        #     agent_component = a_par * agent_scale + a_perp * agent_scale
+        #     blended = agent_pos + waypoint_component + agent_component
+        # else:
+        #     blended = agent_pos + action * 0.3
+        # --- END AUTOPILOT BLENDING ---
 
-        
-            # Far from waypoint: blend waypoint direction with RL action
-
-            # 1. WAYPOINT COMPONENT: Move directly toward the waypoint
-            # Normalization 
-            direction = to_target / (dist + 1e-6)  # Unit vector toward waypoint
-            
-
-            # Scale step size based on control frequency for consistent behavior
-            # Higher frequency = smaller steps needed for same real-time movement
-            # it was self.ctrl_freq / 30.0
-            base = 0.5 * ( 30.0 / self.ctrl_freq )  # Base step size (scaled for ctrl_freq)
-            step_size = min(base, 0.6 * dist)  # Don't overshoot if waypoint is close
-            waypoint_component = direction * step_size  # Movement toward waypoint
-
-            # 2. AGENT COMPONENT: Allow RL policy to influence movement
-            # Scale RL influence based on distance - more control when far from waypoint
-            # This gives RL more freedom for exploration when not close to target
-            agent_scale = 0.10 if dist < 2.0 else 1  # Smaller scale when close
-            # Allow only non-negative component along the target direction
-            a_par_mag = float(np.dot(action, direction))
-            a_par_mag = max(0.0, a_par_mag)
-            a_par = a_par_mag * direction
-            # Lateral component (orthogonal to direction)
-            a_perp = action - float(np.dot(action, direction)) * direction
-            agent_component = a_par * agent_scale + a_perp * agent_scale
-
-            # 3. FINAL TARGET: Current position + waypoint movement + RL movement
-            blended = agent_pos + waypoint_component + agent_component
-
-        else:
-            # No assigned waypoint: Allow free movement with some damping
-            # RL has full control but movement is scaled down for safety
-            blended = agent_pos + action * 0.3
+        # Neural network provides direction; PID controller handles movement.
+        # Scale the step size based on control frequency for consistent behavior.
+        step_scale = 0.5 * (30.0 / self.ctrl_freq)
+        target = agent_pos + action * step_scale
 
         # Ensure the target position stays within workspace bounds
-        # This prevents drones from trying to fly outside the designated area
-        blended = np.clip(blended, self.workspace_bounds[0], self.workspace_bounds[1])
-        return blended
+        target = np.clip(target, self.workspace_bounds[0], self.workspace_bounds[1])
+        return target
     
     def _computeRewardDict(self):
         """Compute rewards for all agents."""
